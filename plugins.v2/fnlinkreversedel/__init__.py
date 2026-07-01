@@ -20,8 +20,9 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子和历史记录"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "1.0"
+    plugin_version = "1.1"
     plugin_author = "Samuel"
+    author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
     plugin_order = 50
     auth_level = 1

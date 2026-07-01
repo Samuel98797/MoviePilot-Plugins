@@ -6,9 +6,12 @@
     "version": "1.1",
     "icon": "mediasyncdel.png",
     "author": "Samuel",
+    "author_url": "https://github.com/jxxghp/MoviePilot-Plugins",
     "level": 1,
+    "release": true,
     "history": {
-      "v1.1": "从神医SaMediaSyncDel移植handle_torrent、__del_seed、__del_collection、__remove_parent_dir；删种方式直接集成handle_torrent，不再依赖下载器助手；保留DownloadFileDeleted兜底监听；配置项简化"
+      "v1.0": "初始化版本，支持目录监控、路径映射、种子删除、历史清理",
+      "v1.1": "修复SystemUtils.exits_files参数错误，添加异常处理，优化代码稳定性"
     }
   }
 }
