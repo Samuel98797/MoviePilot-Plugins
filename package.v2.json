@@ -5,7 +5,7 @@
     "labels": "文件整理,做种",
     "version": "1.1",
     "icon": "mediasyncdel.png",
-    "author": "thsrite",
+    "author": "Samuel",
     "level": 1,
     "history": {
       "v1.1": "从神医SaMediaSyncDel移植handle_torrent、__del_seed、__del_collection、__remove_parent_dir；删种方式直接集成handle_torrent，不再依赖下载器助手；保留DownloadFileDeleted兜底监听；配置项简化"

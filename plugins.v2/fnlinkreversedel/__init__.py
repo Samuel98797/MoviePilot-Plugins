@@ -2,13 +2,11 @@ from typing import Any, Dict, List, Tuple
 import os
 import time
 import threading
-from pathlib import Path
 
 from app.plugins import _PluginBase
 from app.core.event import eventmanager, Event
 from app.schemas.types import EventType
 from app.helper.downloader import DownloaderHelper
-from app.utils.system import SystemUtils
 from app.log import logger
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from apscheduler.triggers.interval import IntervalTrigger
@@ -306,12 +304,6 @@ class FnLinkReverseDel(_PluginBase):
                     if keyword in path_str:
                         return False
 
-            if not SystemUtils.exits_files(path_str):
-                return False
-
-            if os.path.isdir(path_str):
-                return False
-
             return True
         return False
 
@@ -359,10 +351,18 @@ class FnLinkReverseDel(_PluginBase):
         mapped_path = self._map_path(file_path)
 
         history_oper = DownloadHistoryOper()
-        hashs = history_oper.get_hashs_by_fullpath(mapped_path)
+        try:
+            hashs = history_oper.get_hashs_by_fullpath(mapped_path)
+        except Exception as e:
+            logger.error(f"[硬链接反向删除] 获取hash失败: {str(e)}")
+            hashs = []
 
         if not hashs:
-            hashs = history_oper.get_hashs_by_fullpath(file_path)
+            try:
+                hashs = history_oper.get_hashs_by_fullpath(file_path)
+            except Exception as e:
+                logger.error(f"[硬链接反向删除] 获取hash失败: {str(e)}")
+                hashs = []
 
         if not hashs:
             logger.info(f"[硬链接反向删除] 未找到文件关联的下载记录: {file_path}")
@@ -391,7 +391,11 @@ class FnLinkReverseDel(_PluginBase):
         logger.info(f"[硬链接反向删除] 删除种子: {hash_value}")
 
         downloader_helper = DownloaderHelper()
-        downloaders = downloader_helper.get_enabled_downloaders()
+        try:
+            downloaders = downloader_helper.get_enabled_downloaders()
+        except Exception as e:
+            logger.error(f"[硬链接反向删除] 获取下载器失败: {str(e)}")
+            return
 
         deleted = False
         for downloader in downloaders:
@@ -418,7 +422,11 @@ class FnLinkReverseDel(_PluginBase):
         logger.info(f"[硬链接反向删除] 删除整理历史: {hash_value}")
 
         history_oper = DownloadHistoryOper()
-        history_records = history_oper.get_files_by_hash(hash_value)
+        try:
+            history_records = history_oper.get_files_by_hash(hash_value)
+        except Exception as e:
+            logger.error(f"[硬链接反向删除] 获取历史记录失败: {str(e)}")
+            return
 
         for record in history_records:
             try:
@@ -426,17 +434,6 @@ class FnLinkReverseDel(_PluginBase):
                 logger.info(f"[硬链接反向删除] 已删除历史记录: {record.filepath}")
             except Exception as e:
                 logger.error(f"[硬链接反向删除] 删除历史记录失败: {str(e)}")
-
-    def __remove_parent_dir(self, file_path: str):
-        """移除空父目录"""
-        try:
-            parent_dir = os.path.dirname(file_path)
-            if os.path.isdir(parent_dir) and not os.listdir(parent_dir):
-                os.rmdir(parent_dir)
-                logger.info(f"[硬链接反向删除] 已移除空目录: {parent_dir}")
-                self.__remove_parent_dir(parent_dir)
-        except Exception as e:
-            logger.error(f"[硬链接反向删除] 移除目录失败: {str(e)}")
 
     def scan_orphan_files(self):
         """扫描孤儿文件"""
@@ -453,7 +450,11 @@ class FnLinkReverseDel(_PluginBase):
         logger.info("[硬链接反向删除] 开始扫描孤儿文件")
 
         history_oper = DownloadHistoryOper()
-        all_history = history_oper.list_history()
+        try:
+            all_history = history_oper.list_history()
+        except Exception as e:
+            logger.error(f"[硬链接反向删除] 获取历史记录失败: {str(e)}")
+            return
 
         for record in all_history:
             if not record.filepath:
