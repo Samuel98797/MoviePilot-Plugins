@@ -3,7 +3,7 @@
     "name": "硬链接反向删除",
     "description": "监控硬链接目录，文件删除时同步删除关联种子和历史记录",
     "labels": "文件整理,做种",
-    "version": "1.1",
+    "version": "1.2",
     "icon": "mediasyncdel.png",
     "author": "Samuel",
     "author_url": "https://github.com/jxxghp/MoviePilot-Plugins",
@@ -11,7 +11,8 @@
     "release": true,
     "history": {
       "v1.0": "初始化版本，支持目录监控、路径映射、种子删除、历史清理",
-      "v1.1": "修复SystemUtils.exits_files参数错误，添加异常处理，优化代码稳定性"
+      "v1.1": "修复SystemUtils.exits_files参数错误，添加异常处理，优化代码稳定性",
+      "v1.2": "修复DownloadHistoryOper API错误，改用list_history遍历匹配，支持目录删除匹配"
     }
   }
 }
