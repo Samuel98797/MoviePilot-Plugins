@@ -3,7 +3,6 @@ import os
 import time
 import threading
 
-from app.chain.transfer import TransferChain
 from app.core.event import eventmanager, Event
 from app.helper.downloader import DownloaderHelper
 from app.log import logger
@@ -16,7 +15,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "1.5"
+    plugin_version = "1.7"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -38,17 +37,32 @@ class FnLinkReverseDel(_PluginBase):
     _transferchain = None
     _downloadhis = None
 
+    @staticmethod
+    def _safe_int(value, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _ensure_chain(self) -> bool:
+        if self._transferchain is None:
+            try:
+                from app.chain.transfer import TransferChain
+                self._transferchain = TransferChain()
+                self._downloadhis = self._transferchain.downloadhis
+            except Exception as e:
+                logger.debug(f"[硬链接反向删除] 初始化TransferChain失败: {str(e)}")
+        return self._downloadhis is not None
+
     def init_plugin(self, config: dict = None):
-        self._transferchain = TransferChain()
-        self._downloadhis = self._transferchain.downloadhis
-        config = config or {}
-        self._enabled = bool(config.get("enabled"))
-        self._monitor_dirs = config.get("monitor_dirs", "")
-        self._path_mappings = config.get("path_mappings", "")
-        self._exclude_keywords = config.get("exclude_keywords", "")
-        self._delay_delete = int(config.get("delay_delete", 5))
-        self._orphan_scan_interval = int(config.get("orphan_scan_interval", 3600))
-        self._stop_watcher()
+        self.stop_service()
+        if config:
+            self._enabled = bool(config.get("enabled"))
+            self._monitor_dirs = config.get("monitor_dirs") or ""
+            self._path_mappings = config.get("path_mappings") or ""
+            self._exclude_keywords = config.get("exclude_keywords") or ""
+            self._delay_delete = self._safe_int(config.get("delay_delete"), 5)
+            self._orphan_scan_interval = self._safe_int(config.get("orphan_scan_interval"), 3600)
         if self._enabled:
             self._start_watcher()
 
@@ -73,94 +87,127 @@ class FnLinkReverseDel(_PluginBase):
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
             {
-                "component": "VForm",
-                "content": [
+                'component': 'VForm',
+                'content': [
                     {
-                        "component": "VRow",
-                        "content": [
+                        'component': 'VRow',
+                        'content': [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 4},
-                                "content": [
-                                    {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}}
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {'component': 'VSwitch', 'props': {'model': 'enabled', 'label': '启用插件'}}
                                 ],
                             },
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [
                                     {
-                                        "component": "VTextField",
-                                        "props": {"model": "delay_delete", "label": "延迟删除(秒)", "type": "number", "min": 0, "max": 60},
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'delay_delete',
+                                            'label': '延迟删除(秒)',
+                                            'type': 'number',
+                                            'placeholder': '5'
+                                        },
                                     }
                                 ],
                             },
                         ],
                     },
                     {
-                        "component": "VRow",
-                        "content": [
+                        'component': 'VRow',
+                        'content': [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {"component": "VTextarea", "props": {"model": "monitor_dirs", "label": "监控目录(硬链接目录)", "rows": 3, "placeholder": "多个目录用换行分隔，如：/video/link"}},
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {"component": "VTextarea", "props": {"model": "path_mappings", "label": "路径映射", "rows": 2, "placeholder": "硬链接路径 -> 下载源路径，如：/video/link -> /downloads"}},
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
-                                    {"component": "VTextField", "props": {"model": "exclude_keywords", "label": "排除关键字", "placeholder": "逗号分隔"}},
-                                ],
-                            },
-                        ],
-                    },
-                    {
-                        "component": "VRow",
-                        "content": [
-                            {
-                                "component": "VCol",
-                                "props": {"cols": 12, "md": 8},
-                                "content": [
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
                                     {
-                                        "component": "VTextField",
-                                        "props": {"model": "orphan_scan_interval", "label": "孤儿扫描间隔(秒)", "type": "number", "min": 60, "max": 86400},
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'monitor_dirs',
+                                            'label': '监控目录(硬链接目录)',
+                                            'rows': '3',
+                                            'placeholder': '多个目录用换行分隔，如：/video/link'
+                                        }
                                     }
                                 ],
                             },
                         ],
                     },
                     {
-                        "component": "VRow",
-                        "content": [
+                        'component': 'VRow',
+                        'content': [
                             {
-                                "component": "VCol",
-                                "props": {"cols": 12},
-                                "content": [
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
                                     {
-                                        "component": "VAlert",
-                                        "props": {
-                                            "type": "warning",
-                                            "variant": "tonal",
-                                            "text": "⚠️ 注意：监控目录必须配置为硬链接目录（媒体库目录），不是下载源目录。路径映射用于将硬链接路径转换为下载器内的源文件路径。"
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'path_mappings',
+                                            'label': '路径映射',
+                                            'rows': '2',
+                                            'placeholder': '硬链接路径 -> 下载源路径，如：/video/link -> /downloads'
+                                        }
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'exclude_keywords',
+                                            'label': '排除关键字',
+                                            'placeholder': '逗号分隔'
+                                        }
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 8},
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'orphan_scan_interval',
+                                            'label': '孤儿扫描间隔(秒)',
+                                            'type': 'number',
+                                            'placeholder': '3600'
+                                        },
+                                    }
+                                ],
+                            },
+                        ],
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '注意：监控目录必须配置为硬链接目录（媒体库目录），不是下载源目录。路径映射用于将硬链接路径转换为下载器内的源文件路径，路径一致可不填。'
                                         }
                                     }
                                 ],
@@ -179,10 +226,50 @@ class FnLinkReverseDel(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
+        logs = self.get_data('logs') or []
+        if not logs:
+            return [
+                {
+                    'component': 'VAlert',
+                    'props': {
+                        'type': 'info',
+                        'variant': 'tonal',
+                        'text': '硬链接反向删除插件 - 监控硬链接目录内文件被删除时同步删除关联做种种子。暂无操作记录。'
+                    }
+                }
+            ]
+        logs = sorted(logs, key=lambda x: x.get('time', ''), reverse=True)[:20]
+        contents = []
+        for log_item in logs:
+            contents.append({
+                'component': 'div',
+                'props': {'class': 'd-flex align-center pa-2 border-b'},
+                'content': [
+                    {
+                        'component': 'div',
+                        'props': {'class': 'text-caption text-grey mr-3 flex-no-shrink'},
+                        'text': log_item.get('time', '')
+                    },
+                    {
+                        'component': 'div',
+                        'props': {'class': 'text-body-2 text-truncate'},
+                        'text': log_item.get('message', '')
+                    }
+                ]
+            })
         return [
             {
-                "component": "VAlert",
-                "props": {"type": "info", "variant": "tonal", "text": "硬链接反向删除插件 - 监控硬链接目录内文件被删除时同步删除关联做种种子"},
+                'component': 'VAlert',
+                'props': {
+                    'type': 'info',
+                    'variant': 'tonal',
+                    'text': '硬链接反向删除插件 - 最近20条操作记录'
+                }
+            },
+            {
+                'component': 'div',
+                'props': {'class': 'mt-3'},
+                'content': contents
             }
         ]
 
@@ -202,6 +289,18 @@ class FnLinkReverseDel(_PluginBase):
 
     def stop_service(self):
         self._stop_watcher()
+
+    def _log_action(self, message: str):
+        try:
+            logs = self.get_data('logs') or []
+            logs.append({
+                'time': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'message': message
+            })
+            logs = logs[-100:]
+            self.save_data('logs', logs)
+        except Exception:
+            pass
 
     def _start_watcher(self):
         self._stop_watcher()
@@ -228,8 +327,17 @@ class FnLinkReverseDel(_PluginBase):
             self._watch_thread.join(timeout=5)
         self._watch_thread = None
 
-    def _normalize_path(self, path_str: str) -> str:
-        return path_str.replace('\\', '/').rstrip('/')
+    @staticmethod
+    def _normalize_path(path_str: str) -> str:
+        return str(path_str).replace('\\', '/').rstrip('/')
+
+    @classmethod
+    def _parent_dir(cls, path_str: str) -> str:
+        norm = cls._normalize_path(path_str)
+        idx = norm.rfind('/')
+        if idx <= 0:
+            return norm
+        return norm[:idx]
 
     def _is_temp_file(self, path_str: str) -> bool:
         path_lower = path_str.lower()
@@ -263,8 +371,8 @@ class FnLinkReverseDel(_PluginBase):
         now = time.time()
         path_norm = self._normalize_path(file_path)
         with self._processing_lock:
-            expired = [k for k, v in self._recent_processed.items() if now - v > window]
-            for k in expired:
+            expired_keys = [k for k, v in self._recent_processed.items() if now - v > window]
+            for k in expired_keys:
                 del self._recent_processed[k]
             if path_norm in self._recent_processed:
                 return True
@@ -306,7 +414,6 @@ class FnLinkReverseDel(_PluginBase):
                         path_str = str(path)
                         path_norm = self._normalize_path(path_str)
                         if self._is_recently_processed(path_norm):
-                            logger.debug(f"[硬链接反向删除] 跳过最近处理过的路径: {path_norm}")
                             continue
                         logger.info(f"[硬链接反向删除] 检测到文件删除: {path_norm}")
                         threading.Thread(
@@ -315,14 +422,13 @@ class FnLinkReverseDel(_PluginBase):
                             daemon=True
                         ).start()
         except ImportError:
-            logger.warning("[硬链接反向删除] watchfiles未安装，将仅使用事件兜底监听")
+            logger.warning("[硬链接反向删除] watchfiles未安装，将仅使用系统事件兜底监听")
         except Exception as e:
             logger.error(f"[硬链接反向删除] 目录监控异常: {str(e)}", exc_info=True)
 
     def _async_handle_delete(self, file_path: str):
         with self._processing_lock:
             if file_path in self._processing_paths:
-                logger.debug(f"[硬链接反向删除] 文件正在处理中，跳过: {file_path}")
                 return
             self._processing_paths.add(file_path)
         try:
@@ -359,16 +465,14 @@ class FnLinkReverseDel(_PluginBase):
             return
         file_path = self._normalize_path(file_path)
         if not self._is_in_monitor_dirs(file_path):
-            logger.debug(f"[硬链接反向删除] 文件不在监控目录内，跳过: {file_path}")
             return
         if self._delay_delete > 0:
-            for i in range(3):
+            for _ in range(3):
                 time.sleep(self._delay_delete / 3)
                 if os.path.exists(file_path):
-                    logger.info(f"[硬链接反向删除] 文件已恢复，跳过删除: {file_path}")
+                    logger.info(f"[硬链接反向删除] 文件已恢复(重命名/移动)，跳过删除: {file_path}")
                     return
         if os.path.exists(file_path):
-            logger.info(f"[硬链接反向删除] 文件仍存在，跳过删除: {file_path}")
             return
         self.handle_torrent(file_path)
 
@@ -381,7 +485,7 @@ class FnLinkReverseDel(_PluginBase):
             return True
         if tf_norm.startswith(target_norm + "/"):
             return True
-        tf_parent = self._normalize_path(os.path.dirname(tf_norm))
+        tf_parent = self._parent_dir(tf_norm)
         if tf_parent == target_norm:
             return True
         return False
@@ -406,6 +510,38 @@ class FnLinkReverseDel(_PluginBase):
                     return file_path.replace(src, dst, 1)
         return file_path
 
+    def _reverse_map_path(self, source_path: str) -> str:
+        if not self._path_mappings:
+            return None
+        source_path = self._normalize_path(source_path)
+        for mapping in self._path_mappings.split("\n"):
+            mapping = mapping.strip()
+            if "->" in mapping:
+                parts = mapping.split("->", 1)
+                link_prefix = self._normalize_path(parts[0].strip())
+                src_prefix = self._normalize_path(parts[1].strip())
+                if src_prefix and source_path.startswith(src_prefix):
+                    return source_path.replace(src_prefix, link_prefix, 1)
+            if "：" in mapping:
+                parts = mapping.split("：", 1)
+                link_prefix = self._normalize_path(parts[0].strip())
+                src_prefix = self._normalize_path(parts[1].strip())
+                if src_prefix and source_path.startswith(src_prefix):
+                    return source_path.replace(src_prefix, link_prefix, 1)
+        return None
+
+    def _file_has_link_in_monitor(self, source_path: str) -> bool:
+        monitor_dirs = [d.strip() for d in self._monitor_dirs.split("\n") if d.strip()]
+        source_norm = self._normalize_path(source_path)
+        linked_path = self._reverse_map_path(source_norm)
+        for md in monitor_dirs:
+            md_norm = self._normalize_path(md)
+            if linked_path and linked_path.startswith(md_norm + "/"):
+                return True
+            if source_norm.startswith(md_norm + "/"):
+                return True
+        return False
+
     def _get_all_downloaders(self):
         downloader_helper = DownloaderHelper()
         downloader_services = []
@@ -428,12 +564,13 @@ class FnLinkReverseDel(_PluginBase):
 
     def handle_torrent(self, file_path: str):
         logger.info(f"[硬链接反向删除] 处理文件删除: {file_path}")
+        self._log_action(f"处理文件删除: {file_path}")
         mapped_path = self._map_path(file_path)
 
         torrent_hash = None
         downloader_name = None
-        try:
-            if self._downloadhis:
+        if self._ensure_chain():
+            try:
                 torrent_hash = self._downloadhis.get_hash_by_fullpath(mapped_path)
                 if not torrent_hash and mapped_path != file_path:
                     torrent_hash = self._downloadhis.get_hash_by_fullpath(file_path)
@@ -444,8 +581,8 @@ class FnLinkReverseDel(_PluginBase):
                             if df and hasattr(df, 'downloader') and df.downloader:
                                 downloader_name = df.downloader
                                 break
-        except Exception as e:
-            logger.debug(f"[硬链接反向删除] 从下载历史查询失败，将遍历种子列表: {str(e)}")
+            except Exception as e:
+                logger.debug(f"[硬链接反向删除] 从下载历史查询失败，将遍历种子列表: {str(e)}")
 
         if torrent_hash:
             self._handle_torrent_by_hash(torrent_hash, file_path, downloader_name)
@@ -453,12 +590,15 @@ class FnLinkReverseDel(_PluginBase):
             self._handle_torrent_by_scan(file_path, mapped_path)
 
     def _handle_torrent_by_hash(self, torrent_hash: str, file_path: str, downloader_name: str = None):
+        if not self._ensure_chain():
+            self._handle_torrent_by_scan(file_path, self._map_path(file_path))
+            return
         try:
             download_files = self._downloadhis.get_files_by_hash(torrent_hash)
             if not download_files:
                 logger.warning(f"[硬链接反向删除] 未找到种子 {torrent_hash} 的文件记录")
                 self.chain.remove_torrents(hashs=torrent_hash, downloader=downloader_name)
-                logger.info(f"[硬链接反向删除] 已删除种子: {torrent_hash}")
+                self._log_action(f"删除种子(无文件记录): {torrent_hash}")
                 return
 
             try:
@@ -477,46 +617,30 @@ class FnLinkReverseDel(_PluginBase):
                     continue
                 source_norm = self._normalize_path(file_path_str)
                 linked_path = self._reverse_map_path(source_norm)
-                if self._normalize_path(file_path) == source_norm or (linked_path and self._normalize_path(file_path) == linked_path):
+                deleted_norm = self._normalize_path(file_path)
+                if deleted_norm == source_norm or (linked_path and deleted_norm == linked_path):
                     continue
                 if linked_path and os.path.exists(linked_path):
                     existing_link_count += 1
-                elif os.path.exists(source_norm):
+                elif self._file_has_link_in_monitor(source_norm) and os.path.exists(source_norm):
                     existing_link_count += 1
 
             if existing_link_count > 0:
-                logger.info(f"[硬链接反向删除] 种子 {torrent_hash} 还有 {existing_link_count} 个文件的硬链接存在，暂停种子")
+                logger.info(f"[硬链接反向删除] 种子 {torrent_hash} 还有 {existing_link_count} 个硬链接存在，暂停种子")
                 self.chain.stop_torrents(hashs=torrent_hash, downloader=downloader_name)
+                self._log_action(f"暂停种子(仍有{existing_link_count}个硬链接): {torrent_hash}")
             else:
                 logger.info(f"[硬链接反向删除] 种子 {torrent_hash} 所有硬链接已删除，删除种子及源文件")
                 self.chain.remove_torrents(hashs=torrent_hash, downloader=downloader_name)
+                self._log_action(f"删除种子(所有硬链接已删): {torrent_hash}")
         except Exception as e:
             logger.error(f"[硬链接反向删除] 处理种子 {torrent_hash} 失败: {str(e)}", exc_info=True)
-
-    def _reverse_map_path(self, source_path: str) -> str:
-        if not self._path_mappings:
-            return None
-        source_path = self._normalize_path(source_path)
-        for mapping in self._path_mappings.split("\n"):
-            mapping = mapping.strip()
-            if "->" in mapping:
-                parts = mapping.split("->", 1)
-                link_prefix = self._normalize_path(parts[0].strip())
-                src_prefix = self._normalize_path(parts[1].strip())
-                if src_prefix and source_path.startswith(src_prefix):
-                    return source_path.replace(src_prefix, link_prefix, 1)
-            if "：" in mapping:
-                parts = mapping.split("：", 1)
-                link_prefix = self._normalize_path(parts[0].strip())
-                src_prefix = self._normalize_path(parts[1].strip())
-                if src_prefix and source_path.startswith(src_prefix):
-                    return source_path.replace(src_prefix, link_prefix, 1)
-        return None
 
     def _handle_torrent_by_scan(self, file_path: str, mapped_path: str):
         downloader_services = self._get_all_downloaders()
         if not downloader_services:
             logger.warning("[硬链接反向删除] 未找到启用的下载器")
+            self._log_action("未找到启用的下载器")
             return
 
         deleted_hashes = set()
@@ -557,17 +681,19 @@ class FnLinkReverseDel(_PluginBase):
                             continue
                         if linked_path and os.path.exists(linked_path):
                             existing_link_count += 1
-                        elif os.path.exists(tf_path):
+                        elif self._file_has_link_in_monitor(tf_path) and os.path.exists(tf_path):
                             existing_link_count += 1
                     if match_found:
                         deleted_hashes.add(torrent_hash)
                         try:
                             if existing_link_count > 0:
-                                logger.info(f"[硬链接反向删除] 找到关联种子({service_name})，还有{existing_link_count}个文件的硬链接存在，暂停: {torrent_name}")
+                                logger.info(f"[硬链接反向删除] 找到关联种子({service_name})，还有{existing_link_count}个硬链接存在，暂停: {torrent_name}")
                                 self.chain.stop_torrents(hashs=torrent_hash, downloader=service_name)
+                                self._log_action(f"暂停种子({service_name}): {torrent_name}")
                             else:
                                 logger.info(f"[硬链接反向删除] 找到关联种子({service_name})，所有硬链接已删除，删除: {torrent_name}")
                                 self.chain.remove_torrents(hashs=torrent_hash, downloader=service_name)
+                                self._log_action(f"删除种子({service_name}): {torrent_name}")
                         except Exception as e:
                             logger.error(f"[硬链接反向删除] 操作种子失败: {torrent_name}, 错误: {str(e)}")
             except Exception as e:
@@ -575,6 +701,7 @@ class FnLinkReverseDel(_PluginBase):
 
         if not deleted_hashes:
             logger.info(f"[硬链接反向删除] 未找到关联种子: {file_path}")
+            self._log_action(f"未找到关联种子: {file_path}")
 
     def scan_orphan_torrents(self):
         if not self.get_state():
@@ -584,31 +711,8 @@ class FnLinkReverseDel(_PluginBase):
             return
 
         logger.info("[硬链接反向删除] 开始扫描孤儿种子")
+        self._log_action("开始扫描孤儿种子")
         self._scan_orphans_by_torrent_list(monitor_dirs)
-
-    def _check_torrent_all_links_deleted(self, file_paths: List[str], monitor_dirs: List[str]) -> Tuple[bool, bool]:
-        all_links_missing = True
-        has_monitored = False
-        for tf_path in file_paths:
-            if not tf_path:
-                continue
-            tf_norm = self._normalize_path(tf_path)
-            linked_path = self._reverse_map_path(tf_norm)
-            in_monitor = False
-            for md in monitor_dirs:
-                md_norm = self._normalize_path(md)
-                if tf_norm.startswith(md_norm + "/") or (linked_path and linked_path.startswith(md_norm + "/")):
-                    in_monitor = True
-                    has_monitored = True
-                    break
-            if in_monitor:
-                if linked_path and os.path.exists(linked_path):
-                    all_links_missing = False
-                    break
-                elif os.path.exists(tf_norm) and not linked_path:
-                    all_links_missing = False
-                    break
-        return all_links_missing, has_monitored
 
     def _scan_orphans_by_torrent_list(self, monitor_dirs: List[str]):
         downloader_services = self._get_all_downloaders()
@@ -643,32 +747,44 @@ class FnLinkReverseDel(_PluginBase):
                     if not file_paths:
                         continue
 
-                    all_missing, has_monitored = self._check_torrent_all_links_deleted(file_paths, monitor_dirs)
-                    if not has_monitored:
-                        continue
-
-                    existing_link_count = 0
+                    monitored_links = 0
+                    existing_links = 0
                     for tf_path in file_paths:
                         if not tf_path:
                             continue
                         linked_path = self._reverse_map_path(tf_path)
+                        in_monitor = False
+                        for md in monitor_dirs:
+                            md_norm = self._normalize_path(md)
+                            if (linked_path and linked_path.startswith(md_norm + "/")) or tf_path.startswith(md_norm + "/"):
+                                in_monitor = True
+                                break
+                        if not in_monitor:
+                            continue
+                        monitored_links += 1
                         if linked_path and os.path.exists(linked_path):
-                            existing_link_count += 1
-                        elif os.path.exists(tf_path) and not linked_path:
-                            existing_link_count += 1
+                            existing_links += 1
+                        elif os.path.exists(tf_path):
+                            existing_links += 1
+
+                    if monitored_links == 0:
+                        continue
 
                     try:
-                        if all_missing or existing_link_count == 0:
+                        if existing_links == 0:
                             self.chain.remove_torrents(hashs=torrent_hash, downloader=service_name)
                             deleted_count += 1
                             logger.info(f"[硬链接反向删除] 删除孤儿种子({service_name}): {torrent_name}")
-                        elif existing_link_count < len(file_paths):
+                            self._log_action(f"删除孤儿种子({service_name}): {torrent_name}")
+                        elif existing_links < monitored_links:
                             self.chain.stop_torrents(hashs=torrent_hash, downloader=service_name)
                             paused_count += 1
-                            logger.info(f"[硬链接反向删除] 部分硬链接已删除，暂停种子({service_name}): {torrent_name}")
+                            logger.info(f"[硬链接反向删除] 部分硬链接已删除({existing_links}/{monitored_links})，暂停种子({service_name}): {torrent_name}")
+                            self._log_action(f"暂停种子(部分缺失{existing_links}/{monitored_links})({service_name}): {torrent_name}")
                     except Exception as e:
                         logger.error(f"[硬链接反向删除] 处理孤儿种子失败: {torrent_name}, 错误: {str(e)}")
             except Exception as e:
                 logger.error(f"[硬链接反向删除] 孤儿扫描失败({service_name}): {str(e)}")
 
         logger.info(f"[硬链接反向删除] 孤儿种子扫描完成，删除 {deleted_count} 个，暂停 {paused_count} 个")
+        self._log_action(f"孤儿扫描完成，删除{deleted_count}个，暂停{paused_count}个")

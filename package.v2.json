@@ -3,7 +3,7 @@
     "name": "硬链接反向删除",
     "description": "监控硬链接目录，文件删除时同步删除关联种子",
     "labels": "文件整理,做种",
-    "version": "1.5",
+    "version": "1.7",
     "icon": "mediasyncdel.png",
     "author": "Samuel",
     "author_url": "https://github.com/jxxghp/MoviePilot-Plugins",
@@ -14,8 +14,10 @@
       "v1.1": "修复SystemUtils.exits_files参数错误，添加异常处理",
       "v1.2": "优化路径匹配逻辑，支持目录删除场景",
       "v1.3": "移除DownloadHistoryOper依赖，直接通过下载器查找种子",
-      "v1.4": "修复watchfiles过滤器失效问题，增加防重复处理机制，修复临时文件误检测，优化路径匹配精度",
-      "v1.5": "深度重构：参考mediasyncdel稳健实现，使用TransferChain.downloadhis正确查询下载历史；支持多下载器遍历；多文件种子智能判断(部分文件删除只暂停、全删才删种)；使用系统链式API(self.chain.remove_torrents/stop_torrents)自动处理辅种/合集；反向路径映射准确检查硬链接存在性；跨平台路径统一处理；孤儿扫描同时支持删除和暂停部分缺失种子"
+      "v1.4": "修复watchfiles过滤器失效问题，增加防重复处理机制",
+      "v1.5": "深度重构：参考mediasyncdel稳健实现，正确使用TransferChain API，支持多下载器，多文件种子智能判断",
+      "v1.6": "修复配置页/详情页不显示问题：TransferChain延迟初始化，props属性值统一字符串格式，增加操作日志详情页",
+      "v1.7": "代码质量深度修复：1)移除错误的下载器API兜底调用(方法名/参数名均错误)；2)init_plugin开头调用stop_service清理定时任务；3)用rfind('/')代替os.path.dirname解决跨平台路径问题；4)孤儿扫描统计只计算监控目录内的文件，避免nfo/srt等辅文件导致误判；5)增加_safe_int防止配置值类型错误；6)修复_recent_processed迭代时修改字典问题；7)_handle_torrent_by_hash增加chain未初始化的fallback；8)日志样式优化"
     }
   }
 }
