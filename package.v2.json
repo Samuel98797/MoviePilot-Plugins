@@ -3,14 +3,14 @@
     "name": "硬链接反向删除",
     "description": "监控硬链接目录，文件删除时同步删除关联种子",
     "labels": "文件整理,做种",
-    "version": "2.2",
+    "version": "2.3",
     "icon": "mediasyncdel.png",
     "author": "Samuel",
     "author_url": "https://github.com/jxxghp/MoviePilot-Plugins",
     "level": 1,
     "release": true,
     "history": {
-      "v2.2": "修复核心查询问题：1)查询转移历史改用get_by_dest(dest)精确查询替代get_by(dest=...)模糊查询——dest存的就是硬链接路径不需要路径映射！之前的路径映射反而把正确的dest路径改错了导致查询失败；2)修复downloadhis.list()方法不存在导致孤儿扫描崩溃，改用list_by_page(page=1,count=99999)；3)修复去重失效：移除_is_recently_processed双重检查，统一用_processing_paths一把锁在入口拦截；4)所有关键查询日志改为INFO级别，用户可直接看到每步查询结果和返回记录数",
+      "v2.3": "修复hash=None导致找不到种子的核心问题：1)日志显示转移历史记录找到但download_hash为空——新增用src源路径反查downloadhis.get_hash_by_fullpath(src)获取hash，再不行用src父目录get_files_by_fullpath遍历匹配；2)修复去重仍有6个线程同时进入——将_processing_paths和_recent_processed合并到同一个锁内原子检查，处理完成后_recent_processed保持120秒窗口持续拦截重复事件；3)查询策略调整为6级递进：get_by_dest→父目录get_by_dest→src反查hash→src父目录遍历→get_by多条件→路径映射",
       "v2.0": "参考mediasyncdel v2插件完全重构：1)采用TransferHistoryOper/DownloadHistoryOper直接实例化（v2框架安全），不再延迟初始化；2)核心判断逻辑使用download_file.state==1（MoviePilot维护的文件存在状态）替代os.path.exists()，刮削重命名场景也能正确识别；3)处理流程标准化：delete_file_by_fullpath标记删除→get_files_by_hash获取该种子所有文件→统计state==1数量决定暂停/删除；4)媒体扩展名使用settings.RMT_MEDIAEXT白名单，过滤nfo/jpg等非视频文件；5)统一路径映射方法_map_path，支持->/中文冒号/英文冒号三种分隔符；6)孤儿扫描基于downloadhis.list()按hash分组统计state，不再遍历下载器；7)新增_should_exclude过滤逻辑在watchfiles层拦截无效事件；8)修复get_services()返回字典的遍历问题"
     }
   }

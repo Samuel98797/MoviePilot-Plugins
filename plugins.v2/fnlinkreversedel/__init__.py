@@ -19,7 +19,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "2.2"
+    plugin_version = "2.3"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -488,10 +488,15 @@ class FnLinkReverseDel(_PluginBase):
 
     def _async_handle_delete(self, file_path: str):
         with self._processing_lock:
-            if file_path in self._processing_paths:
+            now = time.time()
+            expired = [k for k, v in self._recent_processed.items() if now - v > 120]
+            for k in expired:
+                del self._recent_processed[k]
+            if file_path in self._processing_paths or file_path in self._recent_processed:
                 logger.info(f"[硬链接反向删除] 重复事件，已跳过: {file_path}")
                 return
             self._processing_paths.add(file_path)
+            self._recent_processed[file_path] = now
         try:
             self.handle_file_delete(file_path)
         finally:
@@ -581,10 +586,12 @@ class FnLinkReverseDel(_PluginBase):
         try:
             transferhis = self._transferhis.get_by_dest(file_path)
             if transferhis:
-                logger.info(f"[硬链接反向删除] 通过dest路径找到转移记录: src={transferhis.src}, hash={transferhis.download_hash}")
+                src_path = getattr(transferhis, 'src', '') or ''
                 if transferhis.download_hash:
                     torrent_hash = str(transferhis.download_hash)
-                    src_path = getattr(transferhis, 'src', '') or ''
+                    logger.info(f"[硬链接反向删除] 转移记录找到hash: {torrent_hash}, src: {src_path}")
+                else:
+                    logger.info(f"[硬链接反向删除] 转移记录找到但hash为空, src: {src_path}")
             else:
                 logger.info(f"[硬链接反向删除] get_by_dest未找到记录: {file_path}")
         except Exception as e:
@@ -595,14 +602,48 @@ class FnLinkReverseDel(_PluginBase):
             parent = self._parent_dir(file_path)
             try:
                 transferhis = self._transferhis.get_by_dest(parent)
-                if transferhis and transferhis.download_hash:
-                    logger.info(f"[硬链接反向删除] 通过父目录找到转移记录: {parent}")
-                    torrent_hash = str(transferhis.download_hash)
-                    src_path = getattr(transferhis, 'src', '') or ''
+                if transferhis:
+                    if transferhis.download_hash:
+                        torrent_hash = str(transferhis.download_hash)
+                        logger.info(f"[硬链接反向删除] 通过父目录找到hash: {torrent_hash}")
+                    if not src_path:
+                        src_path = getattr(transferhis, 'src', '') or ''
             except Exception as e:
                 logger.debug(f"[硬链接反向删除] 父目录查询失败: {str(e)}")
 
-        # 3. 尝试用get_by多条件查询
+        # 3. 如果有src路径但没有hash，用src路径反查downloadhis
+        if not torrent_hash and src_path:
+            logger.info(f"[硬链接反向删除] 用src路径反查hash: {src_path}")
+            try:
+                torrent_hash = self._downloadhis.get_hash_by_fullpath(src_path)
+                if torrent_hash:
+                    logger.info(f"[硬链接反向删除] 通过src路径找到hash: {torrent_hash}")
+                    try:
+                        dl = self._downloadhis.get_by_hash(torrent_hash)
+                        if dl:
+                            downloader_name = getattr(dl, 'downloader', '') or ''
+                    except Exception:
+                        pass
+                else:
+                    # 4. src精确路径没找到，尝试用src的父目录查询所有下载文件
+                    src_parent = self._parent_dir(src_path)
+                    logger.info(f"[硬链接反向删除] src精确路径未找到，尝试父目录: {src_parent}")
+                    try:
+                        src_files = self._downloadhis.get_files_by_fullpath(src_parent)
+                        if src_files:
+                            for sf in src_files:
+                                sf_path = getattr(sf, 'fullpath', '') or getattr(sf, 'path', '') or ''
+                                if sf_path and self._normalize_path(str(sf_path)) == self._normalize_path(src_path):
+                                    torrent_hash = str(getattr(sf, 'download_hash', '') or '')
+                                    if torrent_hash:
+                                        logger.info(f"[硬链接反向删除] 通过src父目录文件列表找到hash: {torrent_hash}")
+                                        break
+                    except Exception as e:
+                        logger.debug(f"[硬链接反向删除] src父目录查询失败: {str(e)}")
+            except Exception as e:
+                logger.debug(f"[硬链接反向删除] src反查hash失败: {str(e)}")
+
+        # 5. 尝试用get_by多条件查询
         if not torrent_hash:
             try:
                 transfer_list = self._transferhis.get_by(dest=file_path)
@@ -611,34 +652,26 @@ class FnLinkReverseDel(_PluginBase):
                     for th in transfer_list:
                         if th and th.download_hash:
                             torrent_hash = str(th.download_hash)
-                            src_path = getattr(th, 'src', '') or ''
+                            if not src_path:
+                                src_path = getattr(th, 'src', '') or ''
                             break
             except Exception as e:
                 logger.debug(f"[硬链接反向删除] get_by查询失败: {str(e)}")
 
-        # 4. 尝试通过下载历史用源路径反查hash
+        # 6. 尝试用源路径（路径映射）查询
         if not torrent_hash:
             mapped_src = self._map_path(file_path, direction="to_src")
-            logger.info(f"[硬链接反向删除] 尝试通过源路径查询hash: {mapped_src}")
-            try:
-                torrent_hash = self._downloadhis.get_hash_by_fullpath(mapped_src)
-                if not torrent_hash and mapped_src != file_path:
-                    torrent_hash = self._downloadhis.get_hash_by_fullpath(file_path)
-                if torrent_hash:
-                    logger.info(f"[硬链接反向删除] 通过源路径找到hash: {torrent_hash}")
-                    try:
-                        dl = self._downloadhis.get_by_hash(torrent_hash)
-                        if dl:
-                            downloader_name = getattr(dl, 'downloader', '') or ''
-                    except Exception:
-                        pass
-                else:
-                    logger.info(f"[硬链接反向删除] 源路径也未找到hash")
-            except Exception as e:
-                logger.debug(f"[硬链接反向删除] 从下载历史查询hash失败: {str(e)}")
+            if mapped_src != file_path:
+                logger.info(f"[硬链接反向删除] 尝试路径映射后的源路径: {mapped_src}")
+                try:
+                    torrent_hash = self._downloadhis.get_hash_by_fullpath(mapped_src)
+                    if torrent_hash:
+                        logger.info(f"[硬链接反向删除] 通过映射路径找到hash: {torrent_hash}")
+                except Exception as e:
+                    logger.debug(f"[硬链接反向删除] 映射路径查询失败: {str(e)}")
 
         if torrent_hash:
-            logger.info(f"[硬链接反向删除] 找到关联种子hash: {torrent_hash}, downloader: {downloader_name}")
+            logger.info(f"[硬链接反向删除] 最终找到种子hash: {torrent_hash}, downloader: {downloader_name}")
             self._handle_torrent(torrent_hash, src_path or file_path, downloader_name)
         else:
             logger.info(f"[硬链接反向删除] 所有查询方式均未找到种子，尝试扫描下载器")
