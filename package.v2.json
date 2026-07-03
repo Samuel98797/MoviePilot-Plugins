@@ -3,13 +3,14 @@
     "name": "硬链接反向删除",
     "description": "监控硬链接目录，文件删除时同步删除关联种子",
     "labels": "文件整理,做种",
-    "version": "2.0",
+    "version": "2.1",
     "icon": "mediasyncdel.png",
     "author": "Samuel",
     "author_url": "https://github.com/jxxghp/MoviePilot-Plugins",
     "level": 1,
     "release": true,
     "history": {
+      "v2.1": "修复运行时问题：1)新增_parse_monitor_dirs智能解析监控目录，自动识别误填的路径映射格式(如/video/link:/video/movies)并拆分为监控目录+路径映射，避免watchfiles找不到路径；2)修复同一文件删除事件重复处理3次的问题，去重逻辑统一收敛到_async_handle_delete入口用60秒窗口拦截；3)_start_watcher过滤无效目录，无有效目录时不启动监控线程；4)_process_deleted_file添加详细debug日志输出transferhis/downloadhis查询结果，便于排查匹配失败原因",
       "v2.0": "参考mediasyncdel v2插件完全重构：1)采用TransferHistoryOper/DownloadHistoryOper直接实例化（v2框架安全），不再延迟初始化；2)核心判断逻辑使用download_file.state==1（MoviePilot维护的文件存在状态）替代os.path.exists()，刮削重命名场景也能正确识别；3)处理流程标准化：delete_file_by_fullpath标记删除→get_files_by_hash获取该种子所有文件→统计state==1数量决定暂停/删除；4)媒体扩展名使用settings.RMT_MEDIAEXT白名单，过滤nfo/jpg等非视频文件；5)统一路径映射方法_map_path，支持->/中文冒号/英文冒号三种分隔符；6)孤儿扫描基于downloadhis.list()按hash分组统计state，不再遍历下载器；7)新增_should_exclude过滤逻辑在watchfiles层拦截无效事件；8)修复get_services()返回字典的遍历问题"
     }
   }

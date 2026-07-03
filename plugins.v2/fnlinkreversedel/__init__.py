@@ -19,7 +19,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "2.0"
+    plugin_version = "2.1"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -324,24 +324,58 @@ class FnLinkReverseDel(_PluginBase):
         except Exception:
             pass
 
+    def _parse_monitor_dirs(self) -> List[str]:
+        """解析监控目录，自动处理误填的路径映射格式"""
+        monitor_dirs = []
+        auto_mappings = []
+        for line in self._monitor_dirs.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            parts = None
+            for sep in ['->', '：', ':']:
+                if sep in line:
+                    candidate = line.split(sep, 1)
+                    if len(candidate) == 2 and candidate[0].strip().startswith('/'):
+                        parts = candidate
+                        break
+            if parts and len(parts) == 2:
+                monitor_dir = parts[0].strip()
+                src_dir = parts[1].strip()
+                monitor_dirs.append(monitor_dir)
+                if monitor_dir != src_dir:
+                    auto_mappings.append(f"{monitor_dir}->{src_dir}")
+            else:
+                monitor_dirs.append(line)
+        if auto_mappings and not self._path_mappings:
+            self._path_mappings = "\n".join(auto_mappings)
+            logger.info(f"[硬链接反向删除] 自动从监控目录提取路径映射: {auto_mappings}")
+        return monitor_dirs
+
     def _start_watcher(self):
         self._stop_watcher()
-        monitor_dirs = [d.strip() for d in self._monitor_dirs.split("\n") if d.strip()]
+        monitor_dirs = self._parse_monitor_dirs()
         if not monitor_dirs:
             logger.warning("[硬链接反向删除] 未配置监控目录")
             return
+        valid_dirs = []
         for d in monitor_dirs:
             if not os.path.isdir(d):
                 logger.warning(f"[硬链接反向删除] 监控目录不存在: {d}")
+            else:
+                valid_dirs.append(d)
+        if not valid_dirs:
+            logger.error("[硬链接反向删除] 没有有效的监控目录，监控未启动")
+            return
         self._watch_running = True
         self._watch_thread = threading.Thread(
             target=self._watch_loop,
-            args=(monitor_dirs,),
+            args=(valid_dirs,),
             daemon=True,
             name="FnLinkReverseDel.Watcher"
         )
         self._watch_thread.start()
-        logger.info(f"[硬链接反向删除] 目录监控已启动，监控目录: {monitor_dirs}")
+        logger.info(f"[硬链接反向删除] 目录监控已启动，监控目录: {valid_dirs}")
 
     def _stop_watcher(self):
         self._watch_running = False
@@ -385,7 +419,7 @@ class FnLinkReverseDel(_PluginBase):
         return False
 
     def _is_in_monitor_dirs(self, file_path: str) -> bool:
-        monitor_dirs = [d.strip() for d in self._monitor_dirs.split("\n") if d.strip()]
+        monitor_dirs = self._parse_monitor_dirs()
         file_path_norm = self._normalize_path(os.path.normpath(file_path))
         for monitor_dir in monitor_dirs:
             monitor_dir_norm = self._normalize_path(os.path.normpath(monitor_dir))
@@ -441,8 +475,6 @@ class FnLinkReverseDel(_PluginBase):
                     if change_type == Change.deleted:
                         path_str = str(path)
                         path_norm = self._normalize_path(path_str)
-                        if self._is_recently_processed(path_norm):
-                            continue
                         logger.info(f"[硬链接反向删除] 检测到文件删除: {path_norm}")
                         threading.Thread(
                             target=self._async_handle_delete,
@@ -455,6 +487,9 @@ class FnLinkReverseDel(_PluginBase):
             logger.error(f"[硬链接反向删除] 目录监控异常: {str(e)}", exc_info=True)
 
     def _async_handle_delete(self, file_path: str):
+        if self._is_recently_processed(file_path, window=60):
+            logger.debug(f"[硬链接反向删除] 重复事件，已跳过: {file_path}")
+            return
         with self._processing_lock:
             if file_path in self._processing_paths:
                 return
@@ -541,34 +576,44 @@ class FnLinkReverseDel(_PluginBase):
         self._log_action(f"处理文件删除: {os.path.basename(file_path)}")
 
         mp_path = self._map_path(file_path, direction="to_mp")
+        mapped_src = self._map_path(file_path, direction="to_src")
+        logger.debug(f"[硬链接反向删除] 路径映射: 原始={file_path}, MP路径={mp_path}, 源路径={mapped_src}")
+
         torrent_hash = None
         downloader_name = None
         src_path = None
 
         try:
             transfer_list = self._transferhis.get_by(dest=mp_path)
+            logger.debug(f"[硬链接反向删除] transferhis.get_by(dest={mp_path}) 返回 {len(transfer_list) if transfer_list else 0} 条记录")
             if not transfer_list and mp_path != file_path:
                 transfer_list = self._transferhis.get_by(dest=file_path)
+                logger.debug(f"[硬链接反向删除] transferhis.get_by(dest={file_path}) 返回 {len(transfer_list) if transfer_list else 0} 条记录")
             if not transfer_list:
                 parent = self._parent_dir(mp_path)
                 transfer_list = self._transferhis.get_by(dest=parent)
+                logger.debug(f"[硬链接反向删除] transferhis.get_by(dest={parent}) 返回 {len(transfer_list) if transfer_list else 0} 条记录")
                 if not transfer_list and parent != self._parent_dir(file_path):
-                    transfer_list = self._transferhis.get_by(dest=self._parent_dir(file_path))
+                    parent2 = self._parent_dir(file_path)
+                    transfer_list = self._transferhis.get_by(dest=parent2)
+                    logger.debug(f"[硬链接反向删除] transferhis.get_by(dest={parent2}) 返回 {len(transfer_list) if transfer_list else 0} 条记录")
             if transfer_list:
                 for th in transfer_list:
                     if th and hasattr(th, 'download_hash') and th.download_hash:
                         torrent_hash = str(th.download_hash)
                         src_path = getattr(th, 'src', '') or ''
+                        logger.info(f"[硬链接反向删除] 从转移历史找到hash: {torrent_hash}, src: {src_path}")
                         break
         except Exception as e:
-            logger.debug(f"[硬链接反向删除] 查询转移历史失败: {str(e)}")
+            logger.error(f"[硬链接反向删除] 查询转移历史失败: {str(e)}", exc_info=True)
 
         if not torrent_hash:
-            mapped_src = self._map_path(file_path, direction="to_src")
             try:
                 torrent_hash = self._downloadhis.get_hash_by_fullpath(mapped_src)
+                logger.debug(f"[硬链接反向删除] downloadhis.get_hash_by_fullpath({mapped_src}) = {torrent_hash}")
                 if not torrent_hash and mapped_src != file_path:
                     torrent_hash = self._downloadhis.get_hash_by_fullpath(file_path)
+                    logger.debug(f"[硬链接反向删除] downloadhis.get_hash_by_fullpath({file_path}) = {torrent_hash}")
                 if torrent_hash:
                     try:
                         dl = self._downloadhis.get_by_hash(torrent_hash)
@@ -751,7 +796,7 @@ class FnLinkReverseDel(_PluginBase):
     def scan_orphan_torrents(self):
         if not self.get_state():
             return
-        monitor_dirs = [d.strip() for d in self._monitor_dirs.split("\n") if d.strip()]
+        monitor_dirs = self._parse_monitor_dirs()
         if not monitor_dirs:
             return
 
