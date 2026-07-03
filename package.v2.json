@@ -3,23 +3,14 @@
     "name": "硬链接反向删除",
     "description": "监控硬链接目录，文件删除时同步删除关联种子",
     "labels": "文件整理,做种",
-    "version": "1.9",
+    "version": "2.0",
     "icon": "mediasyncdel.png",
     "author": "Samuel",
     "author_url": "https://github.com/jxxghp/MoviePilot-Plugins",
     "level": 1,
     "release": true,
     "history": {
-      "v1.0": "初始化版本，支持目录监控、路径映射、种子删除",
-      "v1.1": "修复SystemUtils.exits_files参数错误，添加异常处理",
-      "v1.2": "优化路径匹配逻辑，支持目录删除场景",
-      "v1.3": "移除DownloadHistoryOper依赖，直接通过下载器查找种子",
-      "v1.4": "修复watchfiles过滤器失效问题，增加防重复处理机制",
-      "v1.5": "深度重构：参考mediasyncdel稳健实现，正确使用TransferChain API，支持多下载器，多文件种子智能判断",
-      "v1.6": "修复配置页/详情页不显示问题：TransferChain延迟初始化，props属性值统一字符串格式，增加操作日志详情页",
-      "v1.7": "代码质量深度修复：1)移除错误的下载器API兜底调用；2)init_plugin开头调用stop_service清理定时任务；3)用rfind('/')代替os.path.dirname解决跨平台路径问题；4)孤儿扫描统计只计算监控目录内的文件；5)增加_safe_int防止配置值类型错误；6)修复_recent_processed迭代时修改字典问题；7)_handle_torrent_by_hash增加chain未初始化的fallback",
-      "v1.8": "修复运行时问题：1)修复DownloaderHelper.get_services()返回字典而非列表导致找不到下载器；2)新增_get_torrent_file_paths正确拼接save_path将相对路径转为绝对路径；3)兼容qBittorrent/Transmission保存路径属性",
-      "v1.9": "修复刮削重命名后无法匹配种子的核心问题：1)新增_media_extensions媒体扩展名过滤，忽略nfo/jpg/png等非媒体文件删除事件；2)新增_find_hash_via_transferhis方法，优先通过TransferHis转移历史用dest路径查询源路径和种子hash，彻底解决刮削重命名后路径不一致问题；3)改进scan模式匹配策略：增加_torrent_matches_parent父目录匹配、_count_existing_links_in_dir统计目录内剩余硬链接数、save_path+torrent_name组合匹配；4)修复_ensure_chain同时初始化transferhis"
+      "v2.0": "参考mediasyncdel v2插件完全重构：1)采用TransferHistoryOper/DownloadHistoryOper直接实例化（v2框架安全），不再延迟初始化；2)核心判断逻辑使用download_file.state==1（MoviePilot维护的文件存在状态）替代os.path.exists()，刮削重命名场景也能正确识别；3)处理流程标准化：delete_file_by_fullpath标记删除→get_files_by_hash获取该种子所有文件→统计state==1数量决定暂停/删除；4)媒体扩展名使用settings.RMT_MEDIAEXT白名单，过滤nfo/jpg等非视频文件；5)统一路径映射方法_map_path，支持->/中文冒号/英文冒号三种分隔符；6)孤儿扫描基于downloadhis.list()按hash分组统计state，不再遍历下载器；7)新增_should_exclude过滤逻辑在watchfiles层拦截无效事件；8)修复get_services()返回字典的遍历问题"
     }
   }
 }
