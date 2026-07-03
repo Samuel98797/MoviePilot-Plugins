@@ -15,7 +15,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "1.7"
+    plugin_version = "1.8"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -542,24 +542,53 @@ class FnLinkReverseDel(_PluginBase):
                 return True
         return False
 
+    @staticmethod
+    def _get_torrent_save_path(torrent) -> str:
+        save_path = getattr(torrent, 'save_path', '') or ''
+        if not save_path:
+            save_path = getattr(torrent, 'download_dir', '') or ''
+        return str(save_path)
+
+    def _get_torrent_file_paths(self, torrent) -> List[str]:
+        file_paths = []
+        save_path = self._normalize_path(self._get_torrent_save_path(torrent))
+        torrent_files = getattr(torrent, 'files', []) or []
+        for tf in torrent_files:
+            if hasattr(tf, 'path'):
+                rel_path = str(tf.path)
+            elif hasattr(tf, 'name'):
+                rel_path = str(tf.name)
+            else:
+                rel_path = str(tf)
+            rel_norm = self._normalize_path(rel_path)
+            if save_path:
+                full_path = f"{save_path}/{rel_norm}" if rel_norm else save_path
+            else:
+                full_path = rel_norm
+            file_paths.append(full_path)
+        if not file_paths and save_path:
+            torrent_name = getattr(torrent, 'name', '')
+            if torrent_name:
+                file_paths.append(f"{save_path}/{self._normalize_path(str(torrent_name))}")
+            else:
+                file_paths.append(save_path)
+        return file_paths
+
     def _get_all_downloaders(self):
-        downloader_helper = DownloaderHelper()
         downloader_services = []
         try:
-            services = downloader_helper.get_services()
-            if services:
+            services = DownloaderHelper().get_services()
+            if services and isinstance(services, dict):
+                for service_name, service_info in services.items():
+                    if service_info and hasattr(service_info, 'instance') and service_info.instance:
+                        downloader_services.append((str(service_name), service_info.instance))
+            elif services:
                 for service in services:
-                    if hasattr(service, 'instance'):
-                        downloader_services.append(service)
-        except Exception:
-            pass
-        if not downloader_services:
-            try:
-                service = downloader_helper.get_service()
-                if service:
-                    downloader_services.append(service)
-            except Exception:
-                pass
+                    instance = getattr(service, 'instance', None) or service
+                    name = getattr(service, 'name', 'default')
+                    downloader_services.append((str(name), instance))
+        except Exception as e:
+            logger.debug(f"[硬链接反向删除] 获取下载器列表失败: {str(e)}")
         return downloader_services
 
     def handle_torrent(self, file_path: str):
@@ -645,28 +674,17 @@ class FnLinkReverseDel(_PluginBase):
 
         deleted_hashes = set()
         file_norm = self._normalize_path(file_path)
-        for service in downloader_services:
+        for service_name, downloader in downloader_services:
             try:
-                service_name = getattr(service, 'name', 'default')
-                torrents = service.instance.get_torrents()
+                torrents = downloader.get_torrents()
                 for torrent in torrents:
                     torrent_hash = getattr(torrent, 'hash', '') or getattr(torrent, 'hashString', '')
                     if not torrent_hash or torrent_hash in deleted_hashes:
                         continue
                     torrent_name = getattr(torrent, 'name', str(torrent_hash))
-                    torrent_files = getattr(torrent, 'files', []) or []
-                    file_paths = []
-                    for tf in torrent_files:
-                        if hasattr(tf, 'path'):
-                            file_paths.append(self._normalize_path(str(tf.path)))
-                        elif hasattr(tf, 'name'):
-                            file_paths.append(self._normalize_path(str(tf.name)))
-                        else:
-                            file_paths.append(self._normalize_path(str(tf)))
+                    file_paths = self._get_torrent_file_paths(torrent)
                     if not file_paths:
-                        torrent_path = getattr(torrent, 'path', '') or getattr(torrent, 'save_path', '')
-                        if torrent_path:
-                            file_paths = [self._normalize_path(str(torrent_path))]
+                        continue
                     match_found = False
                     existing_link_count = 0
                     for tf_path in file_paths:
@@ -722,28 +740,15 @@ class FnLinkReverseDel(_PluginBase):
 
         deleted_count = 0
         paused_count = 0
-        for service in downloader_services:
+        for service_name, downloader in downloader_services:
             try:
-                service_name = getattr(service, 'name', 'default')
-                torrents = service.instance.get_torrents()
+                torrents = downloader.get_torrents()
                 for torrent in torrents:
                     torrent_hash = getattr(torrent, 'hash', '') or getattr(torrent, 'hashString', '')
                     if not torrent_hash:
                         continue
                     torrent_name = getattr(torrent, 'name', str(torrent_hash))
-                    torrent_files = getattr(torrent, 'files', []) or []
-                    file_paths = []
-                    for tf in torrent_files:
-                        if hasattr(tf, 'path'):
-                            file_paths.append(self._normalize_path(str(tf.path)))
-                        elif hasattr(tf, 'name'):
-                            file_paths.append(self._normalize_path(str(tf.name)))
-                        else:
-                            file_paths.append(self._normalize_path(str(tf)))
-                    if not file_paths:
-                        torrent_path = getattr(torrent, 'path', '') or getattr(torrent, 'save_path', '')
-                        if torrent_path:
-                            file_paths = [self._normalize_path(str(torrent_path))]
+                    file_paths = self._get_torrent_file_paths(torrent)
                     if not file_paths:
                         continue
 
