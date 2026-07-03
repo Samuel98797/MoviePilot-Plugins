@@ -3,7 +3,7 @@
     "name": "硬链接反向删除",
     "description": "监控硬链接目录，文件删除时同步删除关联种子",
     "labels": "文件整理,做种",
-    "version": "1.8",
+    "version": "1.9",
     "icon": "mediasyncdel.png",
     "author": "Samuel",
     "author_url": "https://github.com/jxxghp/MoviePilot-Plugins",
@@ -17,8 +17,9 @@
       "v1.4": "修复watchfiles过滤器失效问题，增加防重复处理机制",
       "v1.5": "深度重构：参考mediasyncdel稳健实现，正确使用TransferChain API，支持多下载器，多文件种子智能判断",
       "v1.6": "修复配置页/详情页不显示问题：TransferChain延迟初始化，props属性值统一字符串格式，增加操作日志详情页",
-      "v1.7": "代码质量深度修复：1)移除错误的下载器API兜底调用(方法名/参数名均错误)；2)init_plugin开头调用stop_service清理定时任务；3)用rfind('/')代替os.path.dirname解决跨平台路径问题；4)孤儿扫描统计只计算监控目录内的文件，避免nfo/srt等辅文件导致误判；5)增加_safe_int防止配置值类型错误；6)修复_recent_processed迭代时修改字典问题；7)_handle_torrent_by_hash增加chain未初始化的fallback；8)日志样式优化",
-      "v1.8": "修复运行时关键问题：1)修复DownloaderHelper.get_services()返回字典而非列表导致遍历失败，找不到下载器问题；2)新增_get_torrent_file_paths方法，正确拼接save_path将种子内相对路径转为绝对路径，解决路径匹配失败问题；3)兼容qBittorrent(save_path)和Transmission(download_dir)两种保存路径属性"
+      "v1.7": "代码质量深度修复：1)移除错误的下载器API兜底调用；2)init_plugin开头调用stop_service清理定时任务；3)用rfind('/')代替os.path.dirname解决跨平台路径问题；4)孤儿扫描统计只计算监控目录内的文件；5)增加_safe_int防止配置值类型错误；6)修复_recent_processed迭代时修改字典问题；7)_handle_torrent_by_hash增加chain未初始化的fallback",
+      "v1.8": "修复运行时问题：1)修复DownloaderHelper.get_services()返回字典而非列表导致找不到下载器；2)新增_get_torrent_file_paths正确拼接save_path将相对路径转为绝对路径；3)兼容qBittorrent/Transmission保存路径属性",
+      "v1.9": "修复刮削重命名后无法匹配种子的核心问题：1)新增_media_extensions媒体扩展名过滤，忽略nfo/jpg/png等非媒体文件删除事件；2)新增_find_hash_via_transferhis方法，优先通过TransferHis转移历史用dest路径查询源路径和种子hash，彻底解决刮削重命名后路径不一致问题；3)改进scan模式匹配策略：增加_torrent_matches_parent父目录匹配、_count_existing_links_in_dir统计目录内剩余硬链接数、save_path+torrent_name组合匹配；4)修复_ensure_chain同时初始化transferhis"
     }
   }
 }

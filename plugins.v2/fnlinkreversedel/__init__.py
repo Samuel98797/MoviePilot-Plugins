@@ -15,7 +15,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "1.8"
+    plugin_version = "1.9"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -26,6 +26,7 @@ class FnLinkReverseDel(_PluginBase):
     _monitor_dirs = ""
     _path_mappings = ""
     _exclude_keywords = ""
+    _media_extensions = {'.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.m4v', '.ts', '.mpg', '.mpeg', '.rmvb', '.webm', '.m2ts', '.iso'}
     _temp_extensions = ['.mp', '.part', '.tmp', '.temp', '.!qB', '.!qb', '.downloading', '.crdownload']
     _delay_delete = 5
     _orphan_scan_interval = 3600
@@ -35,6 +36,7 @@ class FnLinkReverseDel(_PluginBase):
     _processing_lock = threading.Lock()
     _recent_processed = {}
     _transferchain = None
+    _transferhis = None
     _downloadhis = None
 
     @staticmethod
@@ -49,10 +51,11 @@ class FnLinkReverseDel(_PluginBase):
             try:
                 from app.chain.transfer import TransferChain
                 self._transferchain = TransferChain()
+                self._transferhis = self._transferchain.transferhis
                 self._downloadhis = self._transferchain.downloadhis
             except Exception as e:
                 logger.debug(f"[硬链接反向删除] 初始化TransferChain失败: {str(e)}")
-        return self._downloadhis is not None
+        return self._downloadhis is not None and self._transferhis is not None
 
     def init_plugin(self, config: dict = None):
         self.stop_service()
@@ -346,6 +349,10 @@ class FnLinkReverseDel(_PluginBase):
                 return True
         return False
 
+    def _is_media_file(self, path_str: str) -> bool:
+        _, ext = os.path.splitext(path_str.lower())
+        return ext in self._media_extensions
+
     def _should_exclude(self, path_str: str) -> bool:
         if self._is_temp_file(path_str):
             return True
@@ -465,6 +472,9 @@ class FnLinkReverseDel(_PluginBase):
             return
         file_path = self._normalize_path(file_path)
         if not self._is_in_monitor_dirs(file_path):
+            return
+        if not self._is_media_file(file_path):
+            logger.debug(f"[硬链接反向删除] 非媒体文件，跳过: {file_path}")
             return
         if self._delay_delete > 0:
             for _ in range(3):
@@ -591,14 +601,57 @@ class FnLinkReverseDel(_PluginBase):
             logger.debug(f"[硬链接反向删除] 获取下载器列表失败: {str(e)}")
         return downloader_services
 
+    def _find_hash_via_transferhis(self, file_path: str) -> Tuple[str, str, str]:
+        """通过转移历史查找源路径、下载hash、下载器名称"""
+        if not self._ensure_chain():
+            return None, None, None
+        try:
+            file_norm = self._normalize_path(file_path)
+            transfer_list = self._transferhis.get_by(dest=file_norm)
+            if transfer_list:
+                for th in transfer_list:
+                    if th and hasattr(th, 'download_hash') and th.download_hash:
+                        src = getattr(th, 'src', '') or ''
+                        downloader = ''
+                        try:
+                            dl = self._downloadhis.get_by_hash(th.download_hash)
+                            if dl:
+                                downloader = getattr(dl, 'downloader', '') or ''
+                        except Exception:
+                            pass
+                        return str(th.download_hash), str(src), str(downloader)
+            parent = self._parent_dir(file_norm)
+            transfer_list = self._transferhis.get_by(dest=parent)
+            if transfer_list:
+                for th in transfer_list:
+                    if th and hasattr(th, 'download_hash') and th.download_hash:
+                        src = getattr(th, 'src', '') or ''
+                        downloader = ''
+                        try:
+                            dl = self._downloadhis.get_by_hash(th.download_hash)
+                            if dl:
+                                downloader = getattr(dl, 'downloader', '') or ''
+                        except Exception:
+                            pass
+                        return str(th.download_hash), str(src), str(downloader)
+        except Exception as e:
+            logger.debug(f"[硬链接反向删除] 查询转移历史失败: {str(e)}")
+        return None, None, None
+
     def handle_torrent(self, file_path: str):
         logger.info(f"[硬链接反向删除] 处理文件删除: {file_path}")
-        self._log_action(f"处理文件删除: {file_path}")
+        self._log_action(f"处理文件删除: {os.path.basename(file_path)}")
         mapped_path = self._map_path(file_path)
+        parent_dir = self._parent_dir(file_path)
+        mapped_parent = self._map_path(parent_dir)
 
         torrent_hash = None
         downloader_name = None
-        if self._ensure_chain():
+        src_path = None
+
+        torrent_hash, src_path, downloader_name = self._find_hash_via_transferhis(file_path)
+
+        if not torrent_hash and self._ensure_chain():
             try:
                 torrent_hash = self._downloadhis.get_hash_by_fullpath(mapped_path)
                 if not torrent_hash and mapped_path != file_path:
@@ -611,16 +664,18 @@ class FnLinkReverseDel(_PluginBase):
                                 downloader_name = df.downloader
                                 break
             except Exception as e:
-                logger.debug(f"[硬链接反向删除] 从下载历史查询失败，将遍历种子列表: {str(e)}")
+                logger.debug(f"[硬链接反向删除] 从下载历史查询失败: {str(e)}")
 
         if torrent_hash:
+            logger.info(f"[硬链接反向删除] 通过历史记录找到种子hash: {torrent_hash}")
             self._handle_torrent_by_hash(torrent_hash, file_path, downloader_name)
         else:
-            self._handle_torrent_by_scan(file_path, mapped_path)
+            self._handle_torrent_by_scan(file_path, mapped_path, parent_dir, mapped_parent)
 
     def _handle_torrent_by_hash(self, torrent_hash: str, file_path: str, downloader_name: str = None):
         if not self._ensure_chain():
-            self._handle_torrent_by_scan(file_path, self._map_path(file_path))
+            parent_dir = self._parent_dir(file_path)
+            self._handle_torrent_by_scan(file_path, self._map_path(file_path), parent_dir, self._map_path(parent_dir))
             return
         try:
             download_files = self._downloadhis.get_files_by_hash(torrent_hash)
@@ -665,7 +720,56 @@ class FnLinkReverseDel(_PluginBase):
         except Exception as e:
             logger.error(f"[硬链接反向删除] 处理种子 {torrent_hash} 失败: {str(e)}", exc_info=True)
 
-    def _handle_torrent_by_scan(self, file_path: str, mapped_path: str):
+    def _torrent_matches_parent(self, file_paths: List[str], parent_dir: str, mapped_parent: str) -> bool:
+        parent_norm = self._normalize_path(parent_dir)
+        mapped_parent_norm = self._normalize_path(mapped_parent)
+        for tf_path in file_paths:
+            if not tf_path:
+                continue
+            tf_norm = self._normalize_path(tf_path)
+            tf_parent = self._parent_dir(tf_norm)
+            linked_path = self._reverse_map_path(tf_norm)
+            linked_parent = self._parent_dir(linked_path) if linked_path else None
+            if tf_parent == mapped_parent_norm or tf_parent.startswith(mapped_parent_norm + "/"):
+                return True
+            if linked_parent and (linked_parent == parent_norm or linked_parent.startswith(parent_norm + "/")):
+                return True
+            if tf_norm == mapped_parent_norm or tf_norm.startswith(mapped_parent_norm + "/"):
+                return True
+            if linked_path and (linked_path == parent_norm or linked_path.startswith(parent_norm + "/")):
+                return True
+        return False
+
+    def _count_existing_links_in_dir(self, file_paths: List[str], parent_dir: str) -> int:
+        parent_norm = self._normalize_path(parent_dir)
+        count = 0
+        for tf_path in file_paths:
+            if not tf_path:
+                continue
+            tf_norm = self._normalize_path(tf_path)
+            linked_path = self._reverse_map_path(tf_norm)
+            tf_parent = self._parent_dir(tf_norm)
+            linked_parent = self._parent_dir(linked_path) if linked_path else None
+            in_target_dir = False
+            if linked_parent and (linked_parent == parent_norm or linked_parent.startswith(parent_norm + "/")):
+                in_target_dir = True
+                check_path = linked_path
+            elif tf_parent == self._map_path(parent_norm) or tf_parent.startswith(self._map_path(parent_norm) + "/"):
+                in_target_dir = True
+                check_path = linked_path if linked_path else None
+            else:
+                continue
+            if not in_target_dir:
+                continue
+            if not self._is_media_file(tf_norm):
+                continue
+            if check_path and os.path.exists(check_path):
+                count += 1
+            elif os.path.exists(tf_norm):
+                count += 1
+        return count
+
+    def _handle_torrent_by_scan(self, file_path: str, mapped_path: str, parent_dir: str, mapped_parent: str):
         downloader_services = self._get_all_downloaders()
         if not downloader_services:
             logger.warning("[硬链接反向删除] 未找到启用的下载器")
@@ -674,6 +778,8 @@ class FnLinkReverseDel(_PluginBase):
 
         deleted_hashes = set()
         file_norm = self._normalize_path(file_path)
+        parent_norm = self._normalize_path(parent_dir)
+        dir_name = os.path.basename(parent_norm)
         for service_name, downloader in downloader_services:
             try:
                 torrents = downloader.get_torrents()
@@ -686,7 +792,6 @@ class FnLinkReverseDel(_PluginBase):
                     if not file_paths:
                         continue
                     match_found = False
-                    existing_link_count = 0
                     for tf_path in file_paths:
                         if not tf_path:
                             continue
@@ -695,31 +800,39 @@ class FnLinkReverseDel(_PluginBase):
                                 self._path_matches(tf_path, mapped_path) or
                                 (linked_path and self._path_matches(linked_path, file_path))):
                             match_found = True
-                        if tf_path == file_norm or (linked_path and linked_path == file_norm):
-                            continue
-                        if linked_path and os.path.exists(linked_path):
-                            existing_link_count += 1
-                        elif self._file_has_link_in_monitor(tf_path) and os.path.exists(tf_path):
-                            existing_link_count += 1
-                    if match_found:
-                        deleted_hashes.add(torrent_hash)
-                        try:
-                            if existing_link_count > 0:
-                                logger.info(f"[硬链接反向删除] 找到关联种子({service_name})，还有{existing_link_count}个硬链接存在，暂停: {torrent_name}")
-                                self.chain.stop_torrents(hashs=torrent_hash, downloader=service_name)
-                                self._log_action(f"暂停种子({service_name}): {torrent_name}")
-                            else:
-                                logger.info(f"[硬链接反向删除] 找到关联种子({service_name})，所有硬链接已删除，删除: {torrent_name}")
-                                self.chain.remove_torrents(hashs=torrent_hash, downloader=service_name)
-                                self._log_action(f"删除种子({service_name}): {torrent_name}")
-                        except Exception as e:
-                            logger.error(f"[硬链接反向删除] 操作种子失败: {torrent_name}, 错误: {str(e)}")
+                            break
+                    if not match_found:
+                        match_found = self._torrent_matches_parent(file_paths, parent_dir, mapped_parent)
+                    if not match_found:
+                        save_path = self._normalize_path(self._get_torrent_save_path(torrent))
+                        torrent_name_norm = self._normalize_path(str(torrent_name))
+                        if save_path and mapped_parent:
+                            mp_norm = self._normalize_path(mapped_parent)
+                            if save_path == mp_norm or save_path.startswith(mp_norm + "/"):
+                                match_found = True
+                            elif self._parent_dir(save_path) == mp_norm and dir_name and dir_name in torrent_name_norm:
+                                match_found = True
+                    if not match_found:
+                        continue
+                    deleted_hashes.add(torrent_hash)
+                    existing_link_count = self._count_existing_links_in_dir(file_paths, parent_dir)
+                    try:
+                        if existing_link_count > 0:
+                            logger.info(f"[硬链接反向删除] 找到关联种子({service_name})，媒体目录还有{existing_link_count}个硬链接存在，暂停: {torrent_name}")
+                            self.chain.stop_torrents(hashs=torrent_hash, downloader=service_name)
+                            self._log_action(f"暂停种子({service_name}): {torrent_name[:50]}")
+                        else:
+                            logger.info(f"[硬链接反向删除] 找到关联种子({service_name})，媒体目录所有硬链接已删除，删除: {torrent_name}")
+                            self.chain.remove_torrents(hashs=torrent_hash, downloader=service_name)
+                            self._log_action(f"删除种子({service_name}): {torrent_name[:50]}")
+                    except Exception as e:
+                        logger.error(f"[硬链接反向删除] 操作种子失败: {torrent_name}, 错误: {str(e)}")
             except Exception as e:
                 logger.error(f"[硬链接反向删除] 遍历下载器失败({service_name}): {str(e)}")
 
         if not deleted_hashes:
-            logger.info(f"[硬链接反向删除] 未找到关联种子: {file_path}")
-            self._log_action(f"未找到关联种子: {file_path}")
+            logger.info(f"[硬链接反向删除] 未找到关联种子(媒体目录: {dir_name})")
+            self._log_action(f"未找到关联种子: {dir_name}")
 
     def scan_orphan_torrents(self):
         if not self.get_state():
