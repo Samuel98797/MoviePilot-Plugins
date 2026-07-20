@@ -22,7 +22,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "4.1"
+    plugin_version = "4.3"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -578,10 +578,13 @@ class FnLinkReverseDel(_PluginBase):
         transfer_records_to_delete = []
 
         # 1. 通过转移历史用dest路径查询src源文件路径和hash
+        # 注意：TransferHistoryOper 没有 get_by_dest 方法，使用 get_by(dest=...) 返回列表
         transferhis = None
         try:
-            transferhis = self._transferhis.get_by_dest(file_path)
-            if transferhis:
+            transferhis_list = self._transferhis.get_by(dest=file_path)
+            if transferhis_list:
+                # get_by 返回列表，取第一条（同一路径通常只有一条转移记录）
+                transferhis = transferhis_list[0] if isinstance(transferhis_list, list) else transferhis_list
                 src_path = getattr(transferhis, 'src', '') or (transferhis.get('src', '') if isinstance(transferhis, dict) else '') or ''
                 download_hash = getattr(transferhis, 'download_hash', None) or (transferhis.get('download_hash') if isinstance(transferhis, dict) else None)
                 if download_hash:
@@ -589,25 +592,33 @@ class FnLinkReverseDel(_PluginBase):
                     logger.info(f"[硬链接反向删除] 转移记录找到hash: {torrent_hash}")
                 else:
                     logger.info(f"[硬链接反向删除] 转移记录找到但hash为空, src: {src_path}")
-                transfer_records_to_delete.append(transferhis)
+                # 将所有匹配的转移记录都加入删除列表（通常只有1条，但保险起见全部加入）
+                if isinstance(transferhis_list, list):
+                    transfer_records_to_delete.extend(transferhis_list)
+                else:
+                    transfer_records_to_delete.append(transferhis)
             else:
-                logger.info(f"[硬链接反向删除] get_by_dest未找到记录: {file_path}")
+                logger.info(f"[硬链接反向删除] get_by(dest)未找到记录: {file_path}")
         except Exception as e:
-            logger.error(f"[硬链接反向删除] get_by_dest查询失败: {str(e)}", exc_info=True)
+            logger.error(f"[硬链接反向删除] get_by(dest)查询失败: {str(e)}", exc_info=True)
 
         # 2. 尝试用父目录查询（不覆盖步骤1的transferhis，只获取src_path和hash）
         if not src_path:
             parent = self._parent_dir(file_path)
             try:
-                parent_transferhis = self._transferhis.get_by_dest(parent)
-                if parent_transferhis:
+                parent_list = self._transferhis.get_by(dest=parent)
+                if parent_list:
+                    parent_transferhis = parent_list[0] if isinstance(parent_list, list) else parent_list
                     src_path = getattr(parent_transferhis, 'src', '') or (parent_transferhis.get('src', '') if isinstance(parent_transferhis, dict) else '') or ''
                     parent_hash = getattr(parent_transferhis, 'download_hash', None) or (parent_transferhis.get('download_hash') if isinstance(parent_transferhis, dict) else None)
                     if parent_hash and not torrent_hash:
                         torrent_hash = str(parent_hash)
                     logger.info(f"[硬链接反向删除] 通过父目录找到src: {src_path}")
                     # 父目录查到的转移记录也要加入删除列表
-                    transfer_records_to_delete.append(parent_transferhis)
+                    if isinstance(parent_list, list):
+                        transfer_records_to_delete.extend(parent_list)
+                    else:
+                        transfer_records_to_delete.append(parent_transferhis)
             except Exception as e:
                 logger.debug(f"[硬链接反向删除] 父目录查询失败: {str(e)}")
 
@@ -658,7 +669,14 @@ class FnLinkReverseDel(_PluginBase):
             self._delete_source_file(src_path, fileitem=src_fileitem)
 
     def _find_and_handle_torrent_by_file(self, src_path: str, exclude_hashes: set = None):
-        """遍历所有下载器，通过源文件路径匹配做种任务并删除"""
+        """遍历所有下载器，通过源文件路径匹配做种任务并删除
+
+        优化策略：
+        1. 优先用 save_path+name 路径匹配（无API调用）
+        2. 仅当方式1失败才调用 get_files 精确匹配
+        3. 添加请求间隔避免触发 qBittorrent 限流（403 Forbidden）
+        4. 连续失败熔断，避免无意义重试
+        """
         src_norm = self._normalize_path(src_path)
         src_parent = self._parent_dir(src_norm)
         downloader_services = self._get_all_downloaders()
@@ -672,7 +690,14 @@ class FnLinkReverseDel(_PluginBase):
                     continue
                 if isinstance(torrents, tuple):
                     torrents = torrents[0]
+                # 失败熔断：连续3次get_files返回None则停止该下载器遍历
+                consecutive_failures = 0
+                MAX_FAILURES = 3
                 for torrent in torrents:
+                    # 熔断检查
+                    if consecutive_failures >= MAX_FAILURES:
+                        logger.warning(f"[硬链接反向删除] 连续{MAX_FAILURES}次获取文件列表失败，停止遍历({service_name})，可能是qBittorrent会话过期或限流")
+                        break
                     torrent_hash = ''
                     torrent_name = ''
                     if isinstance(torrent, dict):
@@ -688,14 +713,31 @@ class FnLinkReverseDel(_PluginBase):
                         continue
                     save_path = self._normalize_path(self._get_torrent_save_path(torrent))
                     matched = False
-                    # 匹配方式1：种子的save_path + name 等于 src路径（单文件种子）或src父目录（多文件种子）
+                    # 匹配方式1：种子的save_path + name 路径匹配（无API调用，优先使用）
                     torrent_content_path = f"{save_path}/{self._normalize_path(str(torrent_name))}"
-                    if torrent_content_path == src_norm or torrent_content_path == src_parent:
+                    if torrent_content_path == src_norm:
+                        # 单文件种子：save_path/name == src
                         matched = True
-                    # 匹配方式2：遍历种子内文件列表精确匹配
+                    elif torrent_content_path == src_parent:
+                        # 多文件种子：save_path/name == src的父目录（src直接在种子根目录下）
+                        matched = True
+                    elif src_norm.startswith(torrent_content_path + "/"):
+                        # 多文件种子嵌套：src在save_path/name/子目录下（如Season01/episode01.mkv）
+                        matched = True
+                    # 匹配方式2：遍历种子内文件列表精确匹配（仅在方式1失败时调用）
                     if not matched:
                         try:
+                            # 添加请求间隔避免触发qBittorrent限流（403 Forbidden）
+                            time.sleep(0.1)
                             torrent_files = downloader.get_files(torrent_hash)
+                            if torrent_files is None:
+                                # get_files返回None可能是会话过期或限流，计入失败计数
+                                consecutive_failures += 1
+                                logger.debug(f"[硬链接反向删除] get_files返回None({service_name}/{torrent_hash}), 连续失败{consecutive_failures}次")
+                                continue
+                            else:
+                                # 成功获取则重置失败计数
+                                consecutive_failures = 0
                             if torrent_files:
                                 for tf in torrent_files:
                                     tf_name = ''
@@ -714,7 +756,9 @@ class FnLinkReverseDel(_PluginBase):
                                         matched = True
                                         break
                         except Exception as e:
-                            logger.debug(f"[硬链接反向删除] 获取种子文件列表失败({torrent_hash}): {str(e)}")
+                            consecutive_failures += 1
+                            logger.debug(f"[硬链接反向删除] 获取种子文件列表失败({service_name}/{torrent_hash}): {str(e)}, 连续失败{consecutive_failures}次")
+                            continue
                     if matched:
                         logger.info(f"[硬链接反向删除] 下载器匹配到种子({service_name}): {torrent_name}")
                         # 复用_handle_torrent：基于downloadhis.state判断多文件场景
@@ -742,18 +786,21 @@ class FnLinkReverseDel(_PluginBase):
                     continue
                 # 将源文件路径映射为硬链接路径（用于查询转移记录）
                 mp_path = self._map_path(src_norm, direction="to_mp")
-                # 删除转移记录（通过dest硬链接路径查询，TransferHistoryOper无get_by_src方法）
+                # 删除转移记录（通过dest硬链接路径查询，使用get_by(dest=...)返回列表）
                 try:
-                    transferhis = self._transferhis.get_by_dest(mp_path)
-                    if not transferhis:
+                    transferhis_list = self._transferhis.get_by(dest=mp_path)
+                    if not transferhis_list:
                         # 兜底：尝试用父目录查询
                         mp_parent = self._parent_dir(mp_path)
-                        transferhis = self._transferhis.get_by_dest(mp_parent)
-                    if transferhis:
-                        his_id = getattr(transferhis, 'id', None) or (transferhis.get('id') if isinstance(transferhis, dict) else None)
-                        if his_id is not None:
-                            self._transferhis.delete(his_id)
-                            logger.debug(f"[硬链接反向删除] 孤儿扫描删除转移记录: {his_id}")
+                        transferhis_list = self._transferhis.get_by(dest=mp_parent)
+                    if transferhis_list:
+                        # get_by 返回列表，遍历删除所有匹配的转移记录
+                        records = transferhis_list if isinstance(transferhis_list, list) else [transferhis_list]
+                        for record in records:
+                            his_id = getattr(record, 'id', None) or (record.get('id') if isinstance(record, dict) else None)
+                            if his_id is not None:
+                                self._transferhis.delete(his_id)
+                                logger.debug(f"[硬链接反向删除] 孤儿扫描删除转移记录: {his_id}")
                 except Exception as e:
                     logger.debug(f"[硬链接反向删除] 孤儿扫描删除转移记录失败({mp_path}): {str(e)}")
                 # 删除源文件
