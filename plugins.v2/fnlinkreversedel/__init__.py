@@ -12,7 +12,6 @@ from app.core.config import settings
 from app.core.event import eventmanager, Event
 from app.db.downloadhistory_oper import DownloadHistoryOper
 from app.db.transferhistory_oper import TransferHistoryOper
-from app.helper.downloader import DownloaderHelper
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType
@@ -22,7 +21,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "4.3"
+    plugin_version = "5.1"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -41,7 +40,6 @@ class FnLinkReverseDel(_PluginBase):
     _scheduler = None
     _transferhis = None
     _downloadhis = None
-    _downloader_helper = None
     _storagechain = None
 
     @staticmethod
@@ -59,7 +57,6 @@ class FnLinkReverseDel(_PluginBase):
         self._recent_processed = {}
         self._transferhis = TransferHistoryOper()
         self._downloadhis = DownloadHistoryOper()
-        self._downloader_helper = DownloaderHelper()
         self._storagechain = StorageChain()
 
         if config:
@@ -70,6 +67,8 @@ class FnLinkReverseDel(_PluginBase):
             self._delay_delete = self._safe_int(config.get("delay_delete"), 5)
             self._orphan_scan_interval = self._safe_int(config.get("orphan_scan_interval"), 3600)
             self._force_polling = bool(config.get("force_polling"))
+        # 缓存监控目录列表，避免每次事件都重新解析（性能优化）
+        self._monitor_dirs_cache = self._parse_monitor_dirs() if self._monitor_dirs else []
         if self._enabled:
             self._start_watcher()
 
@@ -420,7 +419,8 @@ class FnLinkReverseDel(_PluginBase):
         return False
 
     def _is_in_monitor_dirs(self, file_path: str) -> bool:
-        monitor_dirs = self._parse_monitor_dirs()
+        # 使用 init_plugin 时缓存的监控目录列表，避免每次事件都重新解析
+        monitor_dirs = self._monitor_dirs_cache or self._parse_monitor_dirs()
         file_path_norm = self._normalize_path(os.path.normpath(file_path))
         for monitor_dir in monitor_dirs:
             monitor_dir_norm = self._normalize_path(os.path.normpath(monitor_dir))
@@ -473,32 +473,29 @@ class FnLinkReverseDel(_PluginBase):
             logger.error(f"[硬链接反向删除] 目录监控异常: {str(e)}", exc_info=True)
 
     def _async_handle_delete(self, file_path: str):
+        # 双重去重：_processing_paths(处理中) + _recent_processed(120秒窗口)
+        # 解决watchfiles对同一次删除触发多次事件导致的重复处理
         with self._processing_lock:
+            # 清理过期的 _recent_processed 记录
+            now = time.time()
+            expired = [k for k, v in self._recent_processed.items() if now - v > 120]
+            for k in expired:
+                del self._recent_processed[k]
+            # 检查1：120秒内已处理过，直接跳过
+            if file_path in self._recent_processed:
+                logger.debug(f"[硬链接反向删除] 重复事件(120秒窗口)，跳过: {file_path}")
+                return
+            # 检查2：正在处理中，直接跳过
             if file_path in self._processing_paths:
+                logger.debug(f"[硬链接反向删除] 重复事件(处理中)，跳过: {file_path}")
                 return
             self._processing_paths.add(file_path)
+            self._recent_processed[file_path] = now
         try:
             self.handle_file_delete(file_path)
         finally:
             with self._processing_lock:
                 self._processing_paths.discard(file_path)
-
-    @eventmanager.register(EventType.DownloadFileDeleted)
-    def on_download_file_deleted(self, event: Event):
-        if not self.get_state():
-            return
-        event_data = event.event_data or {}
-        file_path = event_data.get("file_path") or event_data.get("src")
-        if file_path:
-            file_norm = self._normalize_path(file_path)
-            if not self._is_media_file(file_norm):
-                return
-            logger.info(f"[硬链接反向删除] 系统删除事件触发: {file_norm}")
-            threading.Thread(
-                target=self._async_handle_delete,
-                args=(file_norm,),
-                daemon=True
-            ).start()
 
     @eventmanager.register(EventType.PluginAction)
     def handle_plugin_action(self, event: Event):
@@ -557,287 +554,239 @@ class FnLinkReverseDel(_PluginBase):
         self._process_deleted_file(file_path)
 
     def _process_deleted_file(self, file_path: str):
-        # 去重检查（在延迟等待之后、实际处理之前）
-        with self._processing_lock:
-            now = time.time()
-            expired = [k for k, v in self._recent_processed.items() if now - v > 120]
-            for k in expired:
-                del self._recent_processed[k]
-            if file_path in self._recent_processed:
-                logger.info(f"[硬链接反向删除] 重复处理，已跳过: {file_path}")
-                return
-            self._recent_processed[file_path] = now
+        """处理硬链接文件删除事件（方案B：复用后端逻辑）
 
+        流程：
+        1. 通过 dest 路径查转移记录（含 src_fileitem/download_hash/downloader）
+        2. 调用 StorageChain.delete_media_file 删源文件（与后端 API 一致，自动删空目录）
+        3. 调用 DownloadFiles.delete_by_fullpath 删下载文件记录（state=0）
+        4. 调用 TransferHistoryOper.delete 删转移记录
+        5. 检查种子所有文件是否都已删除，若是才调用 chain.remove_torrents 删做种任务
+        """
+        # 去重检查已在 _async_handle_delete 入口完成（_recent_processed + _processing_paths 双重保险）
         logger.info(f"[硬链接反向删除] 处理文件删除: {file_path}")
         self._log_action(f"处理文件删除: {os.path.basename(file_path)}")
 
-        src_path = None
-        torrent_hash = None
-        downloader_name = None
-        # 收集所有需要删除的转移记录（步骤1和步骤2可能各查到一条）
-        transfer_records_to_delete = []
-
-        # 1. 通过转移历史用dest路径查询src源文件路径和hash
-        # 注意：TransferHistoryOper 没有 get_by_dest 方法，使用 get_by(dest=...) 返回列表
-        transferhis = None
-        try:
-            transferhis_list = self._transferhis.get_by(dest=file_path)
-            if transferhis_list:
-                # get_by 返回列表，取第一条（同一路径通常只有一条转移记录）
-                transferhis = transferhis_list[0] if isinstance(transferhis_list, list) else transferhis_list
-                src_path = getattr(transferhis, 'src', '') or (transferhis.get('src', '') if isinstance(transferhis, dict) else '') or ''
-                download_hash = getattr(transferhis, 'download_hash', None) or (transferhis.get('download_hash') if isinstance(transferhis, dict) else None)
-                if download_hash:
-                    torrent_hash = str(download_hash)
-                    logger.info(f"[硬链接反向删除] 转移记录找到hash: {torrent_hash}")
-                else:
-                    logger.info(f"[硬链接反向删除] 转移记录找到但hash为空, src: {src_path}")
-                # 将所有匹配的转移记录都加入删除列表（通常只有1条，但保险起见全部加入）
-                if isinstance(transferhis_list, list):
-                    transfer_records_to_delete.extend(transferhis_list)
-                else:
-                    transfer_records_to_delete.append(transferhis)
-            else:
-                logger.info(f"[硬链接反向删除] get_by(dest)未找到记录: {file_path}")
-        except Exception as e:
-            logger.error(f"[硬链接反向删除] get_by(dest)查询失败: {str(e)}", exc_info=True)
-
-        # 2. 尝试用父目录查询（不覆盖步骤1的transferhis，只获取src_path和hash）
-        if not src_path:
-            parent = self._parent_dir(file_path)
-            try:
-                parent_list = self._transferhis.get_by(dest=parent)
-                if parent_list:
-                    parent_transferhis = parent_list[0] if isinstance(parent_list, list) else parent_list
-                    src_path = getattr(parent_transferhis, 'src', '') or (parent_transferhis.get('src', '') if isinstance(parent_transferhis, dict) else '') or ''
-                    parent_hash = getattr(parent_transferhis, 'download_hash', None) or (parent_transferhis.get('download_hash') if isinstance(parent_transferhis, dict) else None)
-                    if parent_hash and not torrent_hash:
-                        torrent_hash = str(parent_hash)
-                    logger.info(f"[硬链接反向删除] 通过父目录找到src: {src_path}")
-                    # 父目录查到的转移记录也要加入删除列表
-                    if isinstance(parent_list, list):
-                        transfer_records_to_delete.extend(parent_list)
-                    else:
-                        transfer_records_to_delete.append(parent_transferhis)
-            except Exception as e:
-                logger.debug(f"[硬链接反向删除] 父目录查询失败: {str(e)}")
-
-        # 3. 如果没有hash但有src路径，用src路径反查downloadhis
-        if not torrent_hash and src_path:
-            torrent_hash = self._find_hash_by_src(src_path)
-            if torrent_hash:
-                try:
-                    dl = self._downloadhis.get_by_hash(torrent_hash)
-                    if dl:
-                        # 兼容字典和对象两种访问方式
-                        downloader_name = getattr(dl, 'downloader', '') or (dl.get('downloader', '') if isinstance(dl, dict) else '') or ''
-                except Exception:
-                    pass
-
-        # 4. 删除做种任务
-        handled_hashes = set()
-        if torrent_hash:
-            logger.info(f"[硬链接反向删除] 处理种子: hash={torrent_hash}, downloader={downloader_name}")
-            # 传入src_path用于标记下载历史，为空时传None避免用硬链接路径误标记
-            self._handle_torrent(torrent_hash, src_path or None, downloader_name)
-            handled_hashes.add(torrent_hash)
-
-        # 5. 遍历所有下载器，用src源文件路径匹配并处理其他做种任务
-        if src_path:
-            logger.info(f"[硬链接反向删除] 遍历下载器处理其他做种任务: {src_path}")
-            self._find_and_handle_torrent_by_file(src_path, exclude_hashes=handled_hashes)
-
-        # 6. 删除转移记录和源文件（不管种子是暂停还是删除）
-        if src_path:
-            # 从转移记录获取src_fileitem（用于StorageChain删除）
-            src_fileitem = None
-            # 遍历所有查到的转移记录，逐个删除并提取src_fileitem
-            for record in transfer_records_to_delete:
-                try:
-                    # 尝试从转移记录获取src_fileitem字段（包含完整存储信息）
-                    if src_fileitem is None:
-                        fileitem_dict = getattr(record, 'src_fileitem', None) or (record.get('src_fileitem') if isinstance(record, dict) else None)
-                        if fileitem_dict and isinstance(fileitem_dict, dict):
-                            src_fileitem = schemas.FileItem(**fileitem_dict)
-                    his_id = getattr(record, 'id', None) or (record.get('id') if isinstance(record, dict) else None)
-                    if his_id is not None:
-                        self._transferhis.delete(his_id)
-                        logger.info(f"[硬链接反向删除] 删除转移记录: {his_id}")
-                        self._log_action(f"删除转移记录: {his_id}")
-                except Exception as e:
-                    logger.error(f"[硬链接反向删除] 删除转移记录失败: {str(e)}")
-            self._delete_source_file(src_path, fileitem=src_fileitem)
-
-    def _find_and_handle_torrent_by_file(self, src_path: str, exclude_hashes: set = None):
-        """遍历所有下载器，通过源文件路径匹配做种任务并删除
-
-        优化策略：
-        1. 优先用 save_path+name 路径匹配（无API调用）
-        2. 仅当方式1失败才调用 get_files 精确匹配
-        3. 添加请求间隔避免触发 qBittorrent 限流（403 Forbidden）
-        4. 连续失败熔断，避免无意义重试
-        """
-        src_norm = self._normalize_path(src_path)
-        src_parent = self._parent_dir(src_norm)
-        downloader_services = self._get_all_downloaders()
-        if not downloader_services:
-            logger.warning("[硬链接反向删除] 未找到启用的下载器")
+        # 步骤1：查转移记录（dest = 硬链接路径）
+        histories = self._find_transfer_history(file_path)
+        if not histories:
+            logger.warning(f"[硬链接反向删除] 未找到转移记录，跳过: {file_path}")
+            self._log_action(f"未找到转移记录: {os.path.basename(file_path)}")
             return
-        for service_name, downloader in downloader_services:
+
+        # 步骤2-4：逐个处理转移记录（删源文件、删下载文件记录、删转移记录）
+        processed_hashes = set()
+        for history in histories:
             try:
-                torrents = downloader.get_torrents()
-                if not torrents:
-                    continue
-                if isinstance(torrents, tuple):
-                    torrents = torrents[0]
-                # 失败熔断：连续3次get_files返回None则停止该下载器遍历
-                consecutive_failures = 0
-                MAX_FAILURES = 3
-                for torrent in torrents:
-                    # 熔断检查
-                    if consecutive_failures >= MAX_FAILURES:
-                        logger.warning(f"[硬链接反向删除] 连续{MAX_FAILURES}次获取文件列表失败，停止遍历({service_name})，可能是qBittorrent会话过期或限流")
-                        break
-                    torrent_hash = ''
-                    torrent_name = ''
-                    if isinstance(torrent, dict):
-                        torrent_hash = torrent.get('hash', '') or ''
-                        torrent_name = torrent.get('name', str(torrent_hash))
-                    else:
-                        torrent_hash = getattr(torrent, 'hash', '') or ''
-                        torrent_name = getattr(torrent, 'name', str(torrent_hash))
-                    if not torrent_hash:
-                        continue
-                    # 跳过已通过hash路径处理过的种子
-                    if exclude_hashes and torrent_hash in exclude_hashes:
-                        continue
-                    save_path = self._normalize_path(self._get_torrent_save_path(torrent))
-                    matched = False
-                    # 匹配方式1：种子的save_path + name 路径匹配（无API调用，优先使用）
-                    torrent_content_path = f"{save_path}/{self._normalize_path(str(torrent_name))}"
-                    if torrent_content_path == src_norm:
-                        # 单文件种子：save_path/name == src
-                        matched = True
-                    elif torrent_content_path == src_parent:
-                        # 多文件种子：save_path/name == src的父目录（src直接在种子根目录下）
-                        matched = True
-                    elif src_norm.startswith(torrent_content_path + "/"):
-                        # 多文件种子嵌套：src在save_path/name/子目录下（如Season01/episode01.mkv）
-                        matched = True
-                    # 匹配方式2：遍历种子内文件列表精确匹配（仅在方式1失败时调用）
-                    if not matched:
-                        try:
-                            # 添加请求间隔避免触发qBittorrent限流（403 Forbidden）
-                            time.sleep(0.1)
-                            torrent_files = downloader.get_files(torrent_hash)
-                            if torrent_files is None:
-                                # get_files返回None可能是会话过期或限流，计入失败计数
-                                consecutive_failures += 1
-                                logger.debug(f"[硬链接反向删除] get_files返回None({service_name}/{torrent_hash}), 连续失败{consecutive_failures}次")
-                                continue
-                            else:
-                                # 成功获取则重置失败计数
-                                consecutive_failures = 0
-                            if torrent_files:
-                                for tf in torrent_files:
-                                    tf_name = ''
-                                    if isinstance(tf, dict):
-                                        tf_name = tf.get('name', '') or tf.get('path', '')
-                                    elif hasattr(tf, 'name'):
-                                        tf_name = str(tf.name)
-                                    elif hasattr(tf, 'path'):
-                                        tf_name = str(tf.path)
-                                    else:
-                                        tf_name = str(tf)
-                                    if not tf_name:
-                                        continue
-                                    tf_full = self._normalize_path(f"{save_path}/{self._normalize_path(tf_name)}")
-                                    if tf_full == src_norm:
-                                        matched = True
-                                        break
-                        except Exception as e:
-                            consecutive_failures += 1
-                            logger.debug(f"[硬链接反向删除] 获取种子文件列表失败({service_name}/{torrent_hash}): {str(e)}, 连续失败{consecutive_failures}次")
-                            continue
-                    if matched:
-                        logger.info(f"[硬链接反向删除] 下载器匹配到种子({service_name}): {torrent_name}")
-                        # 复用_handle_torrent：基于downloadhis.state判断多文件场景
-                        # mark_history=False 避免重复标记下载历史（步骤4已标记）
-                        self._handle_torrent(torrent_hash, src_norm, service_name, mark_history=False)
+                download_hash = self._delete_history_and_related(history)
+                if download_hash:
+                    processed_hashes.add(download_hash)
             except Exception as e:
-                logger.error(f"[硬链接反向删除] 遍历下载器失败({service_name}): {str(e)}")
+                logger.error(f"[硬链接反向删除] 处理转移记录失败(id={getattr(history, 'id', '?')}): {str(e)}", exc_info=True)
+
+        # 步骤5：检查种子所有文件是否都已删除，若是才删做种任务（避免误删整季）
+        for download_hash in processed_hashes:
+            try:
+                self._remove_torrent_if_all_deleted(download_hash)
+            except Exception as e:
+                logger.error(f"[硬链接反向删除] 删除做种任务失败(hash={download_hash}): {str(e)}")
+
+    def _find_transfer_history(self, dest_path: str) -> List:
+        """通过 dest 路径查找转移记录，多级查询策略
+
+        查询顺序：
+        1. dest 精确匹配（get_by_dest 返回单条，再用 list_by_hash 扩展同 hash 的所有记录）
+        2. 路径映射推断 src 后用 get_by_src 反查（同样用 list_by_hash 扩展）
+
+        注意：移除了"父目录查询"策略，因为父目录的转移记录 src 可能是目录而非文件，
+              会导致 StorageChain 误删整个目录（参考 P0 问题3）
+        """
+        # 策略1：dest 精确匹配
+        try:
+            history = self._transferhis.get_by_dest(dest_path)
+            if history:
+                logger.info(f"[硬链接反向删除] 通过dest精确路径找到转移记录: id={getattr(history, 'id', '?')}")
+                # 用 list_by_hash 扩展：同一 hash 可能有多条转移记录（如多文件种子每集一条）
+                download_hash = getattr(history, 'download_hash', None)
+                if download_hash:
+                    all_histories = self._transferhis.list_by_hash(str(download_hash))
+                    if all_histories and len(all_histories) > 1:
+                        logger.info(f"[硬链接反向删除] 同hash共{len(all_histories)}条转移记录，全部处理")
+                        return all_histories
+                return [history]
+        except Exception as e:
+            logger.debug(f"[硬链接反向删除] dest精确查询失败: {str(e)}")
+
+        # 策略2：路径映射推断 src，再用 get_by_src 反查
+        mapped_src = self._map_path(dest_path, direction="to_src")
+        if mapped_src != dest_path:
+            try:
+                history = self._transferhis.get_by_src(mapped_src)
+                if history:
+                    logger.info(f"[硬链接反向删除] 通过路径映射+get_by_src找到转移记录: id={getattr(history, 'id', '?')}")
+                    download_hash = getattr(history, 'download_hash', None)
+                    if download_hash:
+                        all_histories = self._transferhis.list_by_hash(str(download_hash))
+                        if all_histories and len(all_histories) > 1:
+                            logger.info(f"[硬链接反向删除] 同hash共{len(all_histories)}条转移记录，全部处理")
+                            return all_histories
+                    return [history]
+            except Exception as e:
+                logger.debug(f"[硬链接反向删除] 路径映射反查失败: {str(e)}")
+
+        logger.info(f"[硬链接反向删除] 未找到转移记录: {dest_path}")
+        return []
+
+    def _delete_history_and_related(self, history) -> Optional[str]:
+        """删除单条转移记录及其关联资源（与后端 DELETE /api/v1/history/transfer 行为一致）
+
+        顺序（参考后端 history.py:221）：
+        1. 删源文件（StorageChain.delete_media_file，自动处理空目录）
+        2. 删下载文件记录（DownloadFiles.delete_by_fullpath，state=0）
+        3. 删转移记录（TransferHistory.delete）
+
+        注意：不再在此方法删除做种任务，由调用方统一判断"所有文件是否都已删除"后决定是否删除种子
+
+        :return: 成功处理的 download_hash（用于后续判断是否删种子），失败返回 None
+        """
+        # 提取字段
+        his_id = getattr(history, 'id', None)
+        src_path = getattr(history, 'src', '') or ''
+        download_hash = getattr(history, 'download_hash', None) or ''
+        src_fileitem_dict = getattr(history, 'src_fileitem', None) or {}
+
+        if download_hash:
+            download_hash = str(download_hash)
+
+        # 步骤1：删除源文件（使用 StorageChain，与后端一致）
+        if src_path:
+            src_fileitem = None
+            # 优先用转移记录中的 src_fileitem（包含完整存储信息，与后端 API 一致）
+            if isinstance(src_fileitem_dict, dict) and src_fileitem_dict:
+                try:
+                    src_fileitem = schemas.FileItem(**src_fileitem_dict)
+                except Exception as e:
+                    logger.debug(f"[硬链接反向删除] 构造src_fileitem失败: {str(e)}")
+            # 兜底：从路径构造（默认local存储，不检查文件是否存在，与后端一致）
+            if src_fileitem is None and src_path:
+                src_fileitem = self._build_fileitem_from_path(src_path)
+            if src_fileitem:
+                try:
+                    # delete_media_file 会自动：删文件 → 删空父目录（不删媒体库根目录）
+                    state = self._storagechain.delete_media_file(src_fileitem)
+                    if state:
+                        logger.info(f"[硬链接反向删除] 已删除源文件: {src_path}")
+                        self._log_action(f"删除源文件: {os.path.basename(src_path)}")
+                    else:
+                        logger.warning(f"[硬链接反向删除] 源文件删除失败(可能已不存在): {src_path}")
+                except Exception as e:
+                    logger.error(f"[硬链接反向删除] 删除源文件异常: {src_path}, {str(e)}")
+
+        # 步骤2：删除下载文件记录（state=0，与后端一致）
+        if src_path:
+            try:
+                self._downloadhis.delete_file_by_fullpath(fullpath=src_path)
+                logger.debug(f"[硬链接反向删除] 已标记下载文件记录删除: {src_path}")
+            except Exception as e:
+                logger.debug(f"[硬链接反向删除] 标记下载文件记录失败(非致命): {str(e)}")
+
+        # 步骤3：删除转移记录
+        if his_id is not None:
+            try:
+                self._transferhis.delete(his_id)
+                logger.info(f"[硬链接反向删除] 已删除转移记录: {his_id}")
+                self._log_action(f"删除转移记录: {his_id}")
+            except Exception as e:
+                logger.error(f"[硬链接反向删除] 删除转移记录失败: {str(e)}")
+
+        return download_hash or None
+
+    def _remove_torrent_if_all_deleted(self, download_hash: str):
+        """检查种子所有文件是否都已删除（state=0），若是才删除做种任务
+
+        避免误删整季：多文件种子中，只有当所有文件都被标记删除（state=0）时才删种子任务。
+        否则保留种子，让其他文件继续做种。
+
+        :param download_hash: 种子hash
+        """
+        if not download_hash:
+            return
+        try:
+            # 查询该 hash 的所有下载文件记录
+            dl_files = self._downloadhis.get_files_by_hash(download_hash)
+            if not dl_files:
+                logger.info(f"[硬链接反向删除] hash无下载文件记录，跳过删种子: {download_hash[:16]}...")
+                return
+            # 检查是否所有文件都已标记删除（state != 1）
+            has_active = False
+            for df in dl_files:
+                df_state = getattr(df, 'state', 1)
+                if df_state and int(df_state) == 1:
+                    has_active = True
+                    break
+            if has_active:
+                logger.info(f"[硬链接反向删除] 种子仍有活跃文件(state=1)，保留种子: {download_hash[:16]}...")
+                return
+            # 所有文件都已删除，安全删除种子任务
+            # 查询 downloader 名称
+            downloader_name = ''
+            try:
+                dl = self._downloadhis.get_by_hash(download_hash)
+                if dl:
+                    downloader_name = getattr(dl, 'downloader', '') or ''
+            except Exception:
+                pass
+            try:
+                if downloader_name:
+                    logger.info(f"[硬链接反向删除] 删除做种任务: {download_hash}, downloader={downloader_name}")
+                else:
+                    logger.info(f"[硬链接反向删除] 删除做种任务: {download_hash}, 未指定下载器将使用系统默认")
+                # delete_file=False 不删源文件（源文件已在前面步骤删除）
+                self.chain.remove_torrents(hashs=download_hash, downloader=downloader_name)
+                self._log_action(f"删除做种任务: {download_hash[:16]}...")
+            except Exception as e:
+                logger.error(f"[硬链接反向删除] 删除做种任务失败: {str(e)}")
+        except Exception as e:
+            logger.error(f"[硬链接反向删除] 检查种子文件状态失败: {str(e)}")
 
     def _cleanup_orphan_related_records(self, torrent_hash: str, monitor_dirs: List[str]):
-        """删除孤儿种子关联的转移记录和源文件（孤儿扫描专用）
+        """删除孤儿种子关联的转移记录和源文件（孤儿扫描专用，方案B）
 
-        :param torrent_hash: 种子hash
-        :param monitor_dirs: 监控目录列表，用于路径映射
+        复用 _find_transfer_history + _delete_history_and_related，与主流程一致
+        增加监控目录校验：仅处理监控目录内的文件，避免误删非监控目录的转移记录
         """
         try:
             dl_files = self._downloadhis.get_files_by_hash(torrent_hash)
             if not dl_files:
                 return
             for df in dl_files:
-                src_path = getattr(df, 'path', '') or getattr(df, 'fullpath', '') or ''
+                # DownloadFiles 模型字段：downloader/download_hash/fullpath/savepath/filepath/torrentname/state
+                src_path = getattr(df, 'fullpath', '') or ''
                 if not src_path:
                     continue
                 src_norm = self._normalize_path(str(src_path))
                 if not self._is_media_file(src_norm):
                     continue
-                # 将源文件路径映射为硬链接路径（用于查询转移记录）
+                # 校验：源文件路径映射后必须在监控目录内，避免误删非监控目录的转移记录
                 mp_path = self._map_path(src_norm, direction="to_mp")
-                # 删除转移记录（通过dest硬链接路径查询，使用get_by(dest=...)返回列表）
-                try:
-                    transferhis_list = self._transferhis.get_by(dest=mp_path)
-                    if not transferhis_list:
-                        # 兜底：尝试用父目录查询
-                        mp_parent = self._parent_dir(mp_path)
-                        transferhis_list = self._transferhis.get_by(dest=mp_parent)
-                    if transferhis_list:
-                        # get_by 返回列表，遍历删除所有匹配的转移记录
-                        records = transferhis_list if isinstance(transferhis_list, list) else [transferhis_list]
-                        for record in records:
-                            his_id = getattr(record, 'id', None) or (record.get('id') if isinstance(record, dict) else None)
-                            if his_id is not None:
-                                self._transferhis.delete(his_id)
-                                logger.debug(f"[硬链接反向删除] 孤儿扫描删除转移记录: {his_id}")
-                except Exception as e:
-                    logger.debug(f"[硬链接反向删除] 孤儿扫描删除转移记录失败({mp_path}): {str(e)}")
-                # 删除源文件
-                self._delete_source_file(src_norm)
+                in_monitor = False
+                for md in monitor_dirs:
+                    md_norm = self._normalize_path(md)
+                    if self._path_starts_with(mp_path, md_norm) or self._path_starts_with(src_norm, md_norm):
+                        in_monitor = True
+                        break
+                if not in_monitor:
+                    logger.debug(f"[硬链接反向删除] 孤儿扫描跳过非监控目录文件: {src_norm}")
+                    continue
+                # 查询并删除转移记录（仅处理监控目录内的）
+                histories = self._find_transfer_history(mp_path)
+                for history in histories:
+                    try:
+                        self._delete_history_and_related(history)
+                    except Exception as e:
+                        logger.debug(f"[硬链接反向删除] 孤儿扫描删除转移记录失败: {str(e)}")
         except Exception as e:
             logger.debug(f"[硬链接反向删除] 孤儿扫描清理关联记录失败({torrent_hash}): {str(e)}")
-
-    def _delete_source_file(self, src_path: str, fileitem: schemas.FileItem = None):
-        """删除源文件（优先使用StorageChain，兼容本地和网络存储）
-
-        :param src_path: 源文件路径字符串
-        :param fileitem: 可选的FileItem对象，优先使用（包含完整存储信息）
-        """
-        if not src_path:
-            return
-        # 注意：chain.remove_torrents默认delete_file=False，不删除源文件
-        # 所以这里需要显式删除源文件
-        try:
-            # 优先使用传入的fileitem（来自转移记录的src_fileitem）
-            if fileitem is None:
-                # 没有fileitem时从路径构造（默认local存储）
-                fileitem = self._build_fileitem_from_path(src_path)
-            if fileitem:
-                # 使用StorageChain删除文件（自动处理权限、网络存储、事件通知）
-                # 不预先检查os.path.exists，让StorageChain内部处理（兼容网络存储）
-                self._storagechain.delete_file(fileitem)
-                logger.info(f"[硬链接反向删除] 已删除源文件: {src_path}")
-                self._log_action(f"删除源文件: {os.path.basename(src_path)}")
-            elif os.path.exists(src_path):
-                # 兜底方案：fileitem构造失败且文件存在时使用os.remove
-                os.remove(src_path)
-                logger.info(f"[硬链接反向删除] 已删除源文件(os): {src_path}")
-                self._log_action(f"删除源文件: {os.path.basename(src_path)}")
-            else:
-                logger.debug(f"[硬链接反向删除] 源文件不存在且无法构造fileitem: {src_path}")
-        except Exception as e:
-            logger.error(f"[硬链接反向删除] 删除源文件失败: {src_path}, 错误: {str(e)}")
 
     @staticmethod
     def _build_fileitem_from_path(path_str: str) -> Optional[schemas.FileItem]:
@@ -848,10 +797,15 @@ class FnLinkReverseDel(_PluginBase):
         """
         try:
             path = Path(path_str)
-            if not path.exists():
-                return None
-            # 判断是文件还是目录
-            file_type = "file" if path.is_file() else "dir"
+            # 不检查文件是否存在，与后端 API 一致
+            # StorageChain.delete_media_file 内部会处理文件不存在的情况
+            # 检查 exists() 会在网络存储场景下误判（如 SMB/NFS 未挂载时返回 False）
+            # 判断是文件还是目录（无法判断时默认按文件处理）
+            file_type = "file"
+            try:
+                file_type = "file" if path.is_file() else "dir"
+            except Exception:
+                pass
             extension = path.suffix[1:] if path.suffix and file_type == "file" else None
             return schemas.FileItem(
                 storage="local",
@@ -860,124 +814,10 @@ class FnLinkReverseDel(_PluginBase):
                 name=path.name,
                 basename=path.stem,
                 extension=extension,
-                modify_time=path.stat().st_mtime,
             )
         except Exception as e:
             logger.debug(f"[硬链接反向删除] 构造FileItem失败({path_str}): {str(e)}")
             return None
-
-    def _find_hash_by_src(self, src_path: str) -> str:
-        """用src源文件路径反查种子hash"""
-        if not src_path:
-            return None
-        logger.debug(f"[硬链接反向删除] 用src路径反查hash: {src_path}")
-        try:
-            torrent_hash = self._downloadhis.get_hash_by_fullpath(src_path)
-            if torrent_hash:
-                logger.info(f"[硬链接反向删除] 通过src精确路径找到hash: {torrent_hash}")
-                return torrent_hash
-        except Exception as e:
-            logger.debug(f"[硬链接反向删除] src精确路径查询失败: {str(e)}")
-        # src精确路径没找到，尝试用src的父目录查询所有下载文件
-        src_parent = self._parent_dir(src_path)
-        logger.debug(f"[硬链接反向删除] src精确路径未找到，尝试父目录: {src_parent}")
-        try:
-            src_files = self._downloadhis.get_files_by_fullpath(src_parent)
-            if src_files:
-                for sf in src_files:
-                    sf_path = getattr(sf, 'fullpath', '') or getattr(sf, 'path', '') or ''
-                    if sf_path and self._normalize_path(str(sf_path)) == self._normalize_path(src_path):
-                        # 安全获取download_hash，避免str(None)='None'
-                        h_raw = getattr(sf, 'download_hash', None)
-                        if not h_raw and isinstance(sf, dict):
-                            h_raw = sf.get('download_hash')
-                        if h_raw:
-                            h = str(h_raw)
-                            logger.info(f"[硬链接反向删除] 通过src父目录文件列表找到hash: {h}")
-                            return h
-        except Exception as e:
-            logger.debug(f"[硬链接反向删除] src父目录查询失败: {str(e)}")
-        return None
-
-    def _handle_torrent(self, torrent_hash: str, src_path: str, downloader_name: str = None,
-                        mark_history: bool = True):
-        """删除下载器里的做种任务
-
-        :param mark_history: 是否标记下载历史删除（多次调用时只在首次调用标记）
-        """
-        try:
-            if mark_history:
-                if src_path:
-                    # 有src_path时直接标记
-                    try:
-                        self._downloadhis.delete_file_by_fullpath(fullpath=src_path)
-                    except Exception as e:
-                        logger.debug(f"[硬链接反向删除] 标记下载历史删除失败(非致命): {str(e)}")
-                else:
-                    # src_path为空时通过hash获取文件列表逐个标记（避免下载历史变孤儿）
-                    try:
-                        dl_files = self._downloadhis.get_files_by_hash(torrent_hash)
-                        if dl_files:
-                            for df in dl_files:
-                                df_path = getattr(df, 'path', '') or getattr(df, 'fullpath', '') or ''
-                                if df_path:
-                                    try:
-                                        self._downloadhis.delete_file_by_fullpath(fullpath=str(df_path))
-                                    except Exception:
-                                        pass
-                    except Exception as e:
-                        logger.debug(f"[硬链接反向删除] 通过hash标记下载历史失败(非致命): {str(e)}")
-            # downloader_name为空时查询一次（调用方未传入时兜底）
-            if not downloader_name:
-                try:
-                    dl = self._downloadhis.get_by_hash(torrent_hash)
-                    if dl:
-                        # 兼容字典和对象两种访问方式
-                        downloader_name = getattr(dl, 'downloader', '') or (dl.get('downloader', '') if isinstance(dl, dict) else '') or ''
-                except Exception:
-                    pass
-            # 直接删除种子任务（chain.remove_torrents默认delete_file=False，不删除源文件）
-            if downloader_name:
-                logger.info(f"[硬链接反向删除] 删除做种任务: {torrent_hash}, downloader={downloader_name}")
-            else:
-                logger.info(f"[硬链接反向删除] 删除做种任务: {torrent_hash}, 未指定下载器将使用系统默认")
-            self.chain.remove_torrents(hashs=torrent_hash, downloader=downloader_name)
-            self._log_action(f"删除做种任务: {torrent_hash[:16]}...")
-        except Exception as e:
-            logger.error(f"[硬链接反向删除] 处理种子 {torrent_hash} 失败: {str(e)}", exc_info=True)
-
-    def _get_torrent_save_path(self, torrent) -> str:
-        # 兼容字典对象和属性对象，支持qB的save_path和Tr的download_dir
-        if isinstance(torrent, dict):
-            save_path = torrent.get('save_path', '') or torrent.get('download_dir', '') or ''
-        else:
-            save_path = getattr(torrent, 'save_path', '') or getattr(torrent, 'download_dir', '') or ''
-        return str(save_path) if save_path else ''
-
-    def _get_all_downloaders(self):
-        """获取所有已启用的下载器实例列表
-
-        :return: [(下载器名称, 下载器实例), ...]
-        """
-        downloader_services = []
-        try:
-            services = self._downloader_helper.get_services()
-            if not services:
-                return downloader_services
-            # 标准情况：get_services() 返回字典 {name: service_info}
-            if isinstance(services, dict):
-                for service_name, service_info in services.items():
-                    if service_info and hasattr(service_info, 'instance') and service_info.instance:
-                        downloader_services.append((str(service_name), service_info.instance))
-            else:
-                # 兜底：非字典格式（列表/元组），遍历每个元素提取instance
-                for service in services:
-                    instance = getattr(service, 'instance', None) or service
-                    name = getattr(service, 'name', 'default')
-                    downloader_services.append((str(name), instance))
-        except Exception as e:
-            logger.debug(f"[硬链接反向删除] 获取下载器列表失败: {str(e)}")
-        return downloader_services
 
     @staticmethod
     def _path_starts_with(path: str, prefix: str) -> bool:
@@ -999,11 +839,15 @@ class FnLinkReverseDel(_PluginBase):
         self._scan_orphans_by_history(monitor_dirs)
 
     def _scan_orphans_by_history(self, monitor_dirs: List[str]):
+        """流式扫描孤儿种子，避免一次性加载所有历史记录导致内存压力
+
+        策略：分批加载 + 按hash分组 + 处理完即释放
+        - 每批 1000 条，加载后按 hash 分组
+        - 同一 hash 的文件可能跨页，所以用字典累积
+        - 每处理完一个 hash 立即从字典移除，释放内存
+        """
         deleted_count = 0
         try:
-            # 分批加载下载历史，按hash分组累积后统一处理
-            # 简化策略：先全部加载并按hash分组，再逐个处理
-            # 这样避免跨页hash被误处理的复杂逻辑
             BATCH_SIZE = 1000
             page = 1
             hash_groups = {}
@@ -1011,19 +855,24 @@ class FnLinkReverseDel(_PluginBase):
                 batch = self._downloadhis.list_by_page(page=page, count=BATCH_SIZE)
                 if not batch:
                     break
+                # 当前批次按 hash 分组
+                new_hashes_in_batch = set()
                 for dl in batch:
                     if not dl or not hasattr(dl, 'download_hash') or not dl.download_hash:
                         continue
                     h = str(dl.download_hash)
                     if h not in hash_groups:
                         hash_groups[h] = []
+                        new_hashes_in_batch.add(h)
                     hash_groups[h].append(dl)
-                # 检查是否还有更多数据
+                # 流式处理：处理完上一批次就已完整的 hash（本批次未再出现）
+                # 简化策略：仅在最后一批处理完所有 hash
                 if len(batch) < BATCH_SIZE:
                     break
                 page += 1
-            # 所有数据加载完毕后，逐个hash处理
-            for torrent_hash, download_files in hash_groups.items():
+            # 所有数据加载完毕后，逐个hash处理（处理完即释放）
+            for torrent_hash in list(hash_groups.keys()):
+                download_files = hash_groups.pop(torrent_hash, [])
                 try:
                     result = self._process_orphan_hash(torrent_hash, download_files, monitor_dirs)
                     if result:
@@ -1055,11 +904,9 @@ class FnLinkReverseDel(_PluginBase):
             monitored_total = 0
             existing_cnt = 0
             for df in download_files:
-                file_path_str = None
-                if hasattr(df, 'path'):
-                    file_path_str = df.path
-                elif hasattr(df, 'fullpath'):
-                    file_path_str = df.fullpath
+                # DownloadFiles 模型字段：downloader/download_hash/fullpath/savepath/filepath/torrentname/state
+                # 没有 path 字段，直接用 fullpath（完整路径）
+                file_path_str = getattr(df, 'fullpath', '') or ''
                 if not file_path_str:
                     continue
                 src_norm = self._normalize_path(str(file_path_str))
