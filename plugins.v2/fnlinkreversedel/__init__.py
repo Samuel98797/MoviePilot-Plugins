@@ -21,7 +21,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "5.1"
+    plugin_version = "5.2"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -683,12 +683,16 @@ class FnLinkReverseDel(_PluginBase):
                     logger.error(f"[硬链接反向删除] 删除源文件异常: {src_path}, {str(e)}")
 
         # 步骤2：删除下载文件记录（state=0，与后端一致）
+        # 关键：后端 DownloadFiles.fullpath 字段使用 POSIX 风格（Path.as_posix()），
+        # delete_by_fullpath 用 == 精确匹配，所以这里必须用 Path(src_path).as_posix() 转换
         if src_path:
             try:
-                self._downloadhis.delete_file_by_fullpath(fullpath=src_path)
-                logger.debug(f"[硬链接反向删除] 已标记下载文件记录删除: {src_path}")
+                # 统一转换为 POSIX 风格，与后端 fullpath 字段存储格式一致
+                src_posix = Path(src_path).as_posix()
+                self._downloadhis.delete_file_by_fullpath(fullpath=src_posix)
+                logger.info(f"[硬链接反向删除] 已标记下载文件记录删除: {src_posix}")
             except Exception as e:
-                logger.debug(f"[硬链接反向删除] 标记下载文件记录失败(非致命): {str(e)}")
+                logger.error(f"[硬链接反向删除] 标记下载文件记录失败: {str(e)}")
 
         # 步骤3：删除转移记录
         if his_id is not None:
@@ -698,6 +702,19 @@ class FnLinkReverseDel(_PluginBase):
                 self._log_action(f"删除转移记录: {his_id}")
             except Exception as e:
                 logger.error(f"[硬链接反向删除] 删除转移记录失败: {str(e)}")
+
+        # download_hash 为空时，用 src_path 反查 downloadhis 获取 hash
+        # 场景：手动整理、非下载来源，转移记录可能没有 download_hash
+        if not download_hash and src_path:
+            try:
+                src_posix = Path(src_path).as_posix()
+                # get_hash_by_fullpath 内部按 fullpath == src_posix 查询
+                hash_from_db = self._downloadhis.get_hash_by_fullpath(src_posix)
+                if hash_from_db:
+                    download_hash = str(hash_from_db)
+                    logger.info(f"[硬链接反向删除] 通过src反查到hash: {download_hash}")
+            except Exception as e:
+                logger.debug(f"[硬链接反向删除] src反查hash失败: {str(e)}")
 
         return download_hash or None
 
@@ -712,20 +729,30 @@ class FnLinkReverseDel(_PluginBase):
         if not download_hash:
             return
         try:
-            # 查询该 hash 的所有下载文件记录
+            # 查询该 hash 的所有下载文件记录（不传 state 参数，查全部）
             dl_files = self._downloadhis.get_files_by_hash(download_hash)
             if not dl_files:
                 logger.info(f"[硬链接反向删除] hash无下载文件记录，跳过删种子: {download_hash[:16]}...")
                 return
             # 检查是否所有文件都已标记删除（state != 1）
             has_active = False
+            total_files = len(dl_files)
+            active_files = 0
             for df in dl_files:
-                df_state = getattr(df, 'state', 1)
-                if df_state and int(df_state) == 1:
+                # DownloadFiles.state: 0=已删除, 1=正常
+                # 兼容 int/str/None 多种类型
+                df_state_raw = getattr(df, 'state', None)
+                try:
+                    df_state = int(df_state_raw) if df_state_raw is not None else 1
+                except (TypeError, ValueError):
+                    df_state = 1
+                if df_state == 1:
                     has_active = True
-                    break
+                    active_files += 1
+                    df_fullpath = getattr(df, 'fullpath', '') or ''
+                    logger.debug(f"[硬链接反向删除] 仍有活跃文件: state={df_state}, fullpath={df_fullpath}")
             if has_active:
-                logger.info(f"[硬链接反向删除] 种子仍有活跃文件(state=1)，保留种子: {download_hash[:16]}...")
+                logger.info(f"[硬链接反向删除] 种子仍有{active_files}/{total_files}个活跃文件(state=1)，保留种子: {download_hash[:16]}...")
                 return
             # 所有文件都已删除，安全删除种子任务
             # 查询 downloader 名称
@@ -738,9 +765,9 @@ class FnLinkReverseDel(_PluginBase):
                 pass
             try:
                 if downloader_name:
-                    logger.info(f"[硬链接反向删除] 删除做种任务: {download_hash}, downloader={downloader_name}")
+                    logger.info(f"[硬链接反向删除] 删除做种任务: {download_hash}, downloader={downloader_name}, 共{total_files}个文件全部已删除")
                 else:
-                    logger.info(f"[硬链接反向删除] 删除做种任务: {download_hash}, 未指定下载器将使用系统默认")
+                    logger.info(f"[硬链接反向删除] 删除做种任务: {download_hash}, 未指定下载器将使用系统默认, 共{total_files}个文件全部已删除")
                 # delete_file=False 不删源文件（源文件已在前面步骤删除）
                 self.chain.remove_torrents(hashs=download_hash, downloader=downloader_name)
                 self._log_action(f"删除做种任务: {download_hash[:16]}...")
@@ -925,8 +952,14 @@ class FnLinkReverseDel(_PluginBase):
                 if not in_monitor:
                     continue
                 monitored_total += 1
-                if hasattr(df, 'state') and df.state and int(df.state) == 1:
-                    existing_cnt += 1
+                if hasattr(df, 'state') and df.state:
+                    # 兼容 int/str 类型，避免 int() 抛 ValueError 导致整个 hash 处理中断
+                    try:
+                        df_state = int(df.state)
+                    except (TypeError, ValueError):
+                        df_state = 1
+                    if df_state == 1:
+                        existing_cnt += 1
             if monitored_total == 0:
                 return False
             # 只有所有监控目录内的文件都不存在了（existing_cnt == 0）才是孤儿
