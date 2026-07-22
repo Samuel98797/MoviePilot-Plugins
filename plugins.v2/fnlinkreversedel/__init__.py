@@ -22,7 +22,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "5.6"
+    plugin_version = "5.7"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -51,6 +51,8 @@ class FnLinkReverseDel(_PluginBase):
             return default
 
     def init_plugin(self, config: dict = None):
+        # 版本标识日志：确认运行的是最新代码（排查 __pycache__ 或插件管理器未更新问题）
+        logger.info(f"[硬链接反向删除] 插件加载，版本: {self.plugin_version}")
         # 先停止旧实例的 watcher（旧工作线程为 daemon，会自行结束，finally 释放旧锁不影响新实例）
         self.stop_service()
         # 可变状态属性在实例上初始化，避免类级别共享
@@ -59,6 +61,7 @@ class FnLinkReverseDel(_PluginBase):
         self._recent_processed = {}
         self._record_lock = threading.Lock()  # 保护 delete_records 并发读写
         self._watch_dedup = {}  # watcher 层去重：路径→时间戳（2秒窗口）
+        self._file_dedup = {}  # 文件级去重：路径→时间戳（60秒窗口，防止重复保存记录）
         self._transferhis = TransferHistoryOper()
         self._downloadhis = DownloadHistoryOper()
         self._storagechain = StorageChain()
@@ -647,10 +650,16 @@ class FnLinkReverseDel(_PluginBase):
             for changes in watch(*normalized_dirs, watch_filter=_DeleteFilter(self), force_polling=self._force_polling):
                 if not self._watch_running:
                     break
+                # 批内去重：同一批 changes 中相同路径只处理一次
+                batch_seen = set()
                 for change_type, path in changes:
                     if change_type == Change.deleted:
                         path_str = str(path)
                         path_norm = self._normalize_path(path_str)
+                        if path_norm in batch_seen:
+                            logger.info(f"[硬链接反向删除] 检测到文件删除(批内重复，跳过): {path_norm}")
+                            continue
+                        batch_seen.add(path_norm)
                         # watcher 层去重：2秒内同一路径只处理一次
                         # 单线程内操作，无需加锁，避免跨线程锁失效问题
                         now = time.time()
@@ -767,6 +776,18 @@ class FnLinkReverseDel(_PluginBase):
         4. 调用 TransferHistoryOper.delete 删转移记录
         5. 检查种子所有文件是否都已删除，若是才调用 chain.remove_torrents 删做种任务
         """
+        # 文件级全局去重：60秒内同一文件只处理一次（多重保险，防止上游去重失效）
+        now = time.time()
+        if hasattr(self, '_file_dedup') and file_path in self._file_dedup:
+            if now - self._file_dedup[file_path] < 60:
+                logger.info(f"[硬链接反向删除] 文件级去重(60秒窗口)，跳过: {file_path}")
+                return
+        if hasattr(self, '_file_dedup'):
+            self._file_dedup[file_path] = now
+            # 清理过期记录
+            expired = [k for k, v in self._file_dedup.items() if now - v > 120]
+            for k in expired:
+                del self._file_dedup[k]
         # 去重检查已在 _async_handle_delete 入口完成（_recent_processed + _processing_paths 双重保险）
         logger.info(f"[硬链接反向删除] 处理文件删除: {file_path}")
 
@@ -910,13 +931,16 @@ class FnLinkReverseDel(_PluginBase):
         if not download_hash and src_path:
             try:
                 src_posix = Path(src_path).as_posix()
+                logger.info(f"[硬链接反向删除] download_hash为空，尝试反查: src_posix={src_posix}")
                 # get_hash_by_fullpath 内部按 fullpath == src_posix 查询
                 hash_from_db = self._downloadhis.get_hash_by_fullpath(src_posix)
                 if hash_from_db:
                     download_hash = str(hash_from_db)
                     logger.info(f"[硬链接反向删除] 通过src反查到hash: {download_hash}")
+                else:
+                    logger.warning(f"[硬链接反向删除] src反查hash返回空(DownloadFiles无此fullpath记录): {src_posix}")
             except Exception as e:
-                logger.warning(f"[硬链接反向删除] src反查hash失败: {str(e)}")
+                logger.warning(f"[硬链接反向删除] src反查hash失败: {str(e)}", exc_info=True)
 
         # 步骤1：删除源文件（使用 StorageChain，与后端一致）
         if src_path:
