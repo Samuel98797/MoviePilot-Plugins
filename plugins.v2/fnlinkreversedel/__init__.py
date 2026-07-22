@@ -22,7 +22,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "5.5"
+    plugin_version = "5.6"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -58,6 +58,7 @@ class FnLinkReverseDel(_PluginBase):
         self._processing_lock = threading.Lock()
         self._recent_processed = {}
         self._record_lock = threading.Lock()  # 保护 delete_records 并发读写
+        self._watch_dedup = {}  # watcher 层去重：路径→时间戳（2秒窗口）
         self._transferhis = TransferHistoryOper()
         self._downloadhis = DownloadHistoryOper()
         self._storagechain = StorageChain()
@@ -650,6 +651,18 @@ class FnLinkReverseDel(_PluginBase):
                     if change_type == Change.deleted:
                         path_str = str(path)
                         path_norm = self._normalize_path(path_str)
+                        # watcher 层去重：2秒内同一路径只处理一次
+                        # 单线程内操作，无需加锁，避免跨线程锁失效问题
+                        now = time.time()
+                        if path_norm in self._watch_dedup:
+                            if now - self._watch_dedup[path_norm] < 2:
+                                logger.info(f"[硬链接反向删除] 检测到文件删除(2秒内重复，跳过): {path_norm}")
+                                continue
+                        self._watch_dedup[path_norm] = now
+                        # 清理过期记录（超过30秒）
+                        expired = [k for k, v in self._watch_dedup.items() if now - v > 30]
+                        for k in expired:
+                            del self._watch_dedup[k]
                         logger.info(f"[硬链接反向删除] 检测到文件删除: {path_norm}")
                         threading.Thread(
                             target=self._async_handle_delete,
@@ -672,11 +685,11 @@ class FnLinkReverseDel(_PluginBase):
                 del self._recent_processed[k]
             # 检查1：120秒内已处理过，直接跳过
             if file_path in self._recent_processed:
-                logger.debug(f"[硬链接反向删除] 重复事件(120秒窗口)，跳过: {file_path}")
+                logger.info(f"[硬链接反向删除] 重复事件(120秒窗口)，跳过: {file_path}")
                 return
             # 检查2：正在处理中，直接跳过
             if file_path in self._processing_paths:
-                logger.debug(f"[硬链接反向删除] 重复事件(处理中)，跳过: {file_path}")
+                logger.info(f"[硬链接反向删除] 重复事件(处理中)，跳过: {file_path}")
                 return
             self._processing_paths.add(file_path)
             self._recent_processed[file_path] = now
@@ -869,6 +882,7 @@ class FnLinkReverseDel(_PluginBase):
         """删除单条转移记录及其关联资源（与后端 DELETE /api/v1/history/transfer 行为一致）
 
         顺序（参考后端 history.py:221）：
+        0. download_hash 为空时先反查（必须在 delete_file_by_fullpath 之前，否则 state=0 后查不到）
         1. 删源文件（StorageChain.delete_media_file，自动处理空目录）
         2. 删下载文件记录（DownloadFiles.delete_by_fullpath，state=0）
         3. 删转移记录（TransferHistory.delete）
@@ -888,6 +902,21 @@ class FnLinkReverseDel(_PluginBase):
 
         if download_hash:
             download_hash = str(download_hash)
+
+        # 步骤0：download_hash 为空时，用 src_path 反查 downloadhis 获取 hash
+        # 关键：必须在 delete_file_by_fullpath 之前执行！
+        # 因为 delete_file_by_fullpath 会将 DownloadFiles.state 改为 0，
+        # 如果 get_hash_by_fullpath 内部过滤 state=1，反查会失败
+        if not download_hash and src_path:
+            try:
+                src_posix = Path(src_path).as_posix()
+                # get_hash_by_fullpath 内部按 fullpath == src_posix 查询
+                hash_from_db = self._downloadhis.get_hash_by_fullpath(src_posix)
+                if hash_from_db:
+                    download_hash = str(hash_from_db)
+                    logger.info(f"[硬链接反向删除] 通过src反查到hash: {download_hash}")
+            except Exception as e:
+                logger.warning(f"[硬链接反向删除] src反查hash失败: {str(e)}")
 
         # 步骤1：删除源文件（使用 StorageChain，与后端一致）
         if src_path:
@@ -933,19 +962,6 @@ class FnLinkReverseDel(_PluginBase):
                 logger.info(f"[硬链接反向删除] 已删除转移记录: {his_id}")
             except Exception as e:
                 logger.error(f"[硬链接反向删除] 删除转移记录失败: {str(e)}")
-
-        # download_hash 为空时，用 src_path 反查 downloadhis 获取 hash
-        # 场景：手动整理、非下载来源，转移记录可能没有 download_hash
-        if not download_hash and src_path:
-            try:
-                src_posix = Path(src_path).as_posix()
-                # get_hash_by_fullpath 内部按 fullpath == src_posix 查询
-                hash_from_db = self._downloadhis.get_hash_by_fullpath(src_posix)
-                if hash_from_db:
-                    download_hash = str(hash_from_db)
-                    logger.info(f"[硬链接反向删除] 通过src反查到hash: {download_hash}")
-            except Exception as e:
-                logger.debug(f"[硬链接反向删除] src反查hash失败: {str(e)}")
 
         return {
             "download_hash": download_hash or None,
