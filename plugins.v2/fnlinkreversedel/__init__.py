@@ -21,7 +21,7 @@ class FnLinkReverseDel(_PluginBase):
     plugin_name = "硬链接反向删除"
     plugin_desc = "监控硬链接目录，文件删除时同步删除关联种子"
     plugin_icon = "mediasyncdel.png"
-    plugin_version = "5.2"
+    plugin_version = "5.3"
     plugin_author = "Samuel"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "fnlinkreversedel_"
@@ -605,17 +605,21 @@ class FnLinkReverseDel(_PluginBase):
         try:
             history = self._transferhis.get_by_dest(dest_path)
             if history:
-                logger.info(f"[硬链接反向删除] 通过dest精确路径找到转移记录: id={getattr(history, 'id', '?')}")
+                logger.info(f"[硬链接反向删除] 通过dest精确路径找到转移记录: id={getattr(history, 'id', '?')}, src={getattr(history, 'src', '')}, download_hash={getattr(history, 'download_hash', None)}")
                 # 用 list_by_hash 扩展：同一 hash 可能有多条转移记录（如多文件种子每集一条）
+                # 关键：list_by_hash 单独 try-except，失败不影响返回 [history]
                 download_hash = getattr(history, 'download_hash', None)
                 if download_hash:
-                    all_histories = self._transferhis.list_by_hash(str(download_hash))
-                    if all_histories and len(all_histories) > 1:
-                        logger.info(f"[硬链接反向删除] 同hash共{len(all_histories)}条转移记录，全部处理")
-                        return all_histories
+                    try:
+                        all_histories = self._transferhis.list_by_hash(str(download_hash))
+                        if all_histories and len(all_histories) > 1:
+                            logger.info(f"[硬链接反向删除] 同hash共{len(all_histories)}条转移记录，全部处理")
+                            return all_histories
+                    except Exception as e:
+                        logger.warning(f"[硬链接反向删除] list_by_hash扩展查询失败(非致命，使用单条记录): {str(e)}")
                 return [history]
         except Exception as e:
-            logger.debug(f"[硬链接反向删除] dest精确查询失败: {str(e)}")
+            logger.error(f"[硬链接反向删除] dest精确查询失败: {str(e)}", exc_info=True)
 
         # 策略2：路径映射推断 src，再用 get_by_src 反查
         mapped_src = self._map_path(dest_path, direction="to_src")
@@ -626,15 +630,18 @@ class FnLinkReverseDel(_PluginBase):
                     logger.info(f"[硬链接反向删除] 通过路径映射+get_by_src找到转移记录: id={getattr(history, 'id', '?')}")
                     download_hash = getattr(history, 'download_hash', None)
                     if download_hash:
-                        all_histories = self._transferhis.list_by_hash(str(download_hash))
-                        if all_histories and len(all_histories) > 1:
-                            logger.info(f"[硬链接反向删除] 同hash共{len(all_histories)}条转移记录，全部处理")
-                            return all_histories
+                        try:
+                            all_histories = self._transferhis.list_by_hash(str(download_hash))
+                            if all_histories and len(all_histories) > 1:
+                                logger.info(f"[硬链接反向删除] 同hash共{len(all_histories)}条转移记录，全部处理")
+                                return all_histories
+                        except Exception as e:
+                            logger.warning(f"[硬链接反向删除] list_by_hash扩展查询失败(非致命，使用单条记录): {str(e)}")
                     return [history]
             except Exception as e:
-                logger.debug(f"[硬链接反向删除] 路径映射反查失败: {str(e)}")
+                logger.error(f"[硬链接反向删除] 路径映射反查失败: {str(e)}", exc_info=True)
 
-        logger.info(f"[硬链接反向删除] 未找到转移记录: {dest_path}")
+        logger.warning(f"[硬链接反向删除] 未找到转移记录: {dest_path}")
         return []
 
     def _delete_history_and_related(self, history) -> Optional[str]:
